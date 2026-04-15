@@ -51,6 +51,7 @@ import cv2
 import toml
 from tqdm import tqdm
 from collections import Counter
+from functools import lru_cache
 from anytree import RenderTree
 from anytree.importer import DictImporter
 import logging
@@ -73,7 +74,67 @@ __email__ = "contact@david-pagnon.com"
 __status__ = "Development"
 
 
+STRICT_TRAJECTORY_KEYPOINTS = {
+    'Head', 'Nose', 'RWrist', 'LWrist',
+    'RBigToe', 'LBigToe', 'RSmallToe', 'LSmallToe', 'RHeel', 'LHeel'
+}
+DEFAULT_LR_SWAP_KEYPOINTS = {
+    'RShoulder', 'LShoulder', 'RElbow', 'LElbow', 'RWrist', 'LWrist',
+    'RHip', 'LHip', 'RKnee', 'LKnee', 'RAnkle', 'LAnkle'
+}
+BONE_PAIRS = [
+    ('RShoulder', 'RElbow'),
+    ('LShoulder', 'LElbow'),
+    ('RElbow', 'RWrist'),
+    ('LElbow', 'LWrist'),
+    ('RHip', 'RKnee'),
+    ('LHip', 'LKnee'),
+    ('RKnee', 'RAnkle'),
+    ('LKnee', 'LAnkle'),
+    ('RAnkle', 'RBigToe'),
+    ('LAnkle', 'LBigToe'),
+]
+LEFT_RIGHT_PAIRS = [
+    ('RWrist', 'LWrist'),
+    ('RElbow', 'LElbow'),
+    ('RAnkle', 'LAnkle'),
+    ('RBigToe', 'LBigToe'),
+    ('RSmallToe', 'LSmallToe'),
+    ('RHeel', 'LHeel'),
+]
+
+
 ## FUNCTIONS
+@lru_cache(maxsize=None)
+def cached_camera_combinations(n_cams, nb_cams_off):
+    '''
+    Cache repeated camera subset enumeration.
+    '''
+
+    return tuple(it.combinations(range(n_cams), nb_cams_off))
+
+
+def resolve_session_dir(project_dir):
+    '''
+    Resolve the session directory that contains calibration assets.
+    '''
+
+    project_dir = os.path.realpath(project_dir)
+    parent_dir = os.path.realpath(os.path.join(project_dir, '..'))
+
+    for candidate in (project_dir, parent_dir, os.getcwd()):
+        try:
+            if any(
+                os.path.isdir(os.path.join(candidate, entry)) and 'calib' in entry.lower()
+                for entry in os.listdir(candidate)
+            ):
+                return candidate
+        except OSError:
+            continue
+
+    return project_dir
+
+
 def count_persons_in_json(file_path):
     '''
     Count the number of persons in a json file.
@@ -146,6 +207,305 @@ def indices_of_first_last_non_nan_chunks(series, min_chunk_size=10, chunk_choice
     
     # Return the trimmed series
     return first_run_start, last_run_end
+
+
+def get_triangulation_keypoint_names(config_dict):
+    '''
+    Retrieve keypoint names in triangulation order.
+    '''
+
+    pose_model = config_dict.get('pose').get('pose_model')
+    try:
+        if pose_model.upper() == 'BODY_WITH_FEET': pose_model = 'HALPE_26'
+        elif pose_model.upper() == 'WHOLE_BODY_WRIST': pose_model = 'COCO_133_WRIST'
+        elif pose_model.upper() == 'WHOLE_BODY': pose_model = 'COCO_133'
+        elif pose_model.upper() == 'BODY': pose_model = 'COCO_17'
+        elif pose_model.upper() == 'HAND': pose_model = 'HAND_21'
+        elif pose_model.upper() == 'FACE': pose_model = 'FACE_106'
+        elif pose_model.upper() == 'ANIMAL': pose_model = 'ANIMAL2D_17'
+        model = eval(pose_model)
+    except:
+        model = import_pose_model_from_config(config_dict, pose_model)
+
+    return [node.name for _, _, node in RenderTree(model) if node.id != None]
+
+
+def import_pose_model_from_config(config_dict, pose_model):
+    '''
+    Import a custom skeleton from Config.toml.
+
+    In this environment, TOML array-of-tables syntax (`[[pose.CUSTOM]]`) is
+    parsed as a one-element list, while DictImporter expects a single dict root.
+    '''
+
+    model_config = config_dict.get('pose').get(pose_model)
+    if isinstance(model_config, list):
+        if len(model_config) != 1:
+            raise ValueError(f'Custom pose model "{pose_model}" must contain exactly one root node.')
+        model_config = model_config[0]
+
+    model = DictImporter().import_(model_config)
+    if model.id == 'None':
+        model.id = None
+    return model
+
+
+def get_keypoint_setting(settings_dict, keypoint_name, default_value):
+    '''
+    Return a keypoint-specific setting with a global fallback.
+    '''
+
+    if not isinstance(settings_dict, dict):
+        return default_value
+
+    aliases = [keypoint_name, keypoint_name.lower(), keypoint_name.upper()]
+    for alias in aliases:
+        if alias in settings_dict:
+            return settings_dict.get(alias)
+    return default_value
+
+
+def get_reprojection_threshold(config_dict, keypoint_name):
+    '''
+    Return keypoint-specific reprojection threshold when configured.
+    '''
+
+    default_threshold = config_dict.get('triangulation').get('reproj_error_threshold_triangulation')
+    thresholds = config_dict.get('triangulation').get('reproj_error_threshold_by_keypoint', {})
+    return float(get_keypoint_setting(thresholds, keypoint_name, default_threshold))
+
+
+def clean_2d_keypoints(config_dict, keypoints_names, x_files, y_files, likelihood_files, prev_coords=None):
+    '''
+    Reject 2D detections that are implausible for fixed-camera gait sequences.
+    '''
+
+    clean_cfg = config_dict.get('triangulation', {}).get('clean_2d', {})
+    if clean_cfg.get('enabled', True) is False:
+        return x_files, y_files, likelihood_files
+
+    likelihood_threshold_default = config_dict.get('triangulation').get('likelihood_threshold_triangulation')
+    likelihood_thresholds = config_dict.get('triangulation').get('likelihood_threshold_by_keypoint', {})
+    jump_thresholds = clean_cfg.get('max_jump_px_by_keypoint', {})
+    strict_jump_px = clean_cfg.get('strict_jump_px', 90.0)
+    default_jump_px = clean_cfg.get('default_jump_px', 140.0)
+    crossing_margin_px = clean_cfg.get('crossing_margin_px', 25.0)
+    bone_ratio_min = clean_cfg.get('bone_ratio_min', 0.4)
+    bone_ratio_max = clean_cfg.get('bone_ratio_max', 2.2)
+    check_left_right_crossing = clean_cfg.get('check_left_right_crossing', True)
+
+    x_clean = np.array(x_files, copy=True)
+    y_clean = np.array(y_files, copy=True)
+    likelihood_clean = np.array(likelihood_files, copy=True)
+
+    for keypoint_idx, keypoint_name in enumerate(keypoints_names):
+        likelihood_threshold = float(get_keypoint_setting(
+            likelihood_thresholds,
+            keypoint_name,
+            likelihood_threshold_default
+        ))
+        invalid_mask = likelihood_clean[:, keypoint_idx] < likelihood_threshold
+        x_clean[invalid_mask, keypoint_idx] = np.nan
+        y_clean[invalid_mask, keypoint_idx] = np.nan
+        likelihood_clean[invalid_mask, keypoint_idx] = np.nan
+
+    if prev_coords is None:
+        return x_clean, y_clean, likelihood_clean
+
+    prev_x, prev_y, _ = prev_coords
+    prev_x = np.asarray(prev_x)
+    prev_y = np.asarray(prev_y)
+
+    for keypoint_idx, keypoint_name in enumerate(keypoints_names):
+        jump_threshold = float(get_keypoint_setting(
+            jump_thresholds,
+            keypoint_name,
+            strict_jump_px if keypoint_name in STRICT_TRAJECTORY_KEYPOINTS else default_jump_px
+        ))
+        current_valid = np.isfinite(x_clean[:, keypoint_idx]) & np.isfinite(y_clean[:, keypoint_idx])
+        previous_valid = np.isfinite(prev_x[:, keypoint_idx]) & np.isfinite(prev_y[:, keypoint_idx])
+        valid_mask = current_valid & previous_valid
+        if not np.any(valid_mask):
+            continue
+
+        dx = x_clean[valid_mask, keypoint_idx] - prev_x[valid_mask, keypoint_idx]
+        dy = y_clean[valid_mask, keypoint_idx] - prev_y[valid_mask, keypoint_idx]
+        jump_mask = np.hypot(dx, dy) > jump_threshold
+        if np.any(jump_mask):
+            invalid_idx = np.where(valid_mask)[0][jump_mask]
+            x_clean[invalid_idx, keypoint_idx] = np.nan
+            y_clean[invalid_idx, keypoint_idx] = np.nan
+            likelihood_clean[invalid_idx, keypoint_idx] = np.nan
+
+    if check_left_right_crossing:
+        keypoint_to_idx = {name: idx for idx, name in enumerate(keypoints_names)}
+        for right_name, left_name in LEFT_RIGHT_PAIRS:
+            if right_name not in keypoint_to_idx or left_name not in keypoint_to_idx:
+                continue
+            right_idx = keypoint_to_idx[right_name]
+            left_idx = keypoint_to_idx[left_name]
+            for cam_idx in range(x_clean.shape[0]):
+                current_valid = np.all(np.isfinite([
+                    x_clean[cam_idx, right_idx], x_clean[cam_idx, left_idx],
+                    prev_x[cam_idx, right_idx], prev_x[cam_idx, left_idx]
+                ]))
+                if not current_valid:
+                    continue
+                previous_dx = prev_x[cam_idx, right_idx] - prev_x[cam_idx, left_idx]
+                current_dx = x_clean[cam_idx, right_idx] - x_clean[cam_idx, left_idx]
+                if abs(previous_dx) <= crossing_margin_px or abs(current_dx) <= crossing_margin_px:
+                    continue
+                if np.sign(previous_dx) == np.sign(current_dx):
+                    continue
+
+                if np.nan_to_num(likelihood_clean[cam_idx, right_idx], nan=-1.0) <= np.nan_to_num(likelihood_clean[cam_idx, left_idx], nan=-1.0):
+                    x_clean[cam_idx, right_idx] = np.nan
+                    y_clean[cam_idx, right_idx] = np.nan
+                    likelihood_clean[cam_idx, right_idx] = np.nan
+                else:
+                    x_clean[cam_idx, left_idx] = np.nan
+                    y_clean[cam_idx, left_idx] = np.nan
+                    likelihood_clean[cam_idx, left_idx] = np.nan
+
+    keypoint_to_idx = {name: idx for idx, name in enumerate(keypoints_names)}
+    for point_a, point_b in BONE_PAIRS:
+        if point_a not in keypoint_to_idx or point_b not in keypoint_to_idx:
+            continue
+        idx_a = keypoint_to_idx[point_a]
+        idx_b = keypoint_to_idx[point_b]
+        for cam_idx in range(x_clean.shape[0]):
+            current_valid = np.all(np.isfinite([
+                x_clean[cam_idx, idx_a], y_clean[cam_idx, idx_a],
+                x_clean[cam_idx, idx_b], y_clean[cam_idx, idx_b],
+                prev_x[cam_idx, idx_a], prev_y[cam_idx, idx_a],
+                prev_x[cam_idx, idx_b], prev_y[cam_idx, idx_b]
+            ]))
+            if not current_valid:
+                continue
+
+            previous_length = np.hypot(
+                prev_x[cam_idx, idx_a] - prev_x[cam_idx, idx_b],
+                prev_y[cam_idx, idx_a] - prev_y[cam_idx, idx_b]
+            )
+            current_length = np.hypot(
+                x_clean[cam_idx, idx_a] - x_clean[cam_idx, idx_b],
+                y_clean[cam_idx, idx_a] - y_clean[cam_idx, idx_b]
+            )
+            if previous_length < 1e-6:
+                continue
+            length_ratio = current_length / previous_length
+            if bone_ratio_min <= length_ratio <= bone_ratio_max:
+                continue
+
+            if np.nan_to_num(likelihood_clean[cam_idx, idx_a], nan=-1.0) <= np.nan_to_num(likelihood_clean[cam_idx, idx_b], nan=-1.0):
+                x_clean[cam_idx, idx_a] = np.nan
+                y_clean[cam_idx, idx_a] = np.nan
+                likelihood_clean[cam_idx, idx_a] = np.nan
+            else:
+                x_clean[cam_idx, idx_b] = np.nan
+                y_clean[cam_idx, idx_b] = np.nan
+                likelihood_clean[cam_idx, idx_b] = np.nan
+
+    return x_clean, y_clean, likelihood_clean
+
+
+def build_keypoint_neighbors(keypoints_names):
+    '''
+    Build neighbor lookup for bone consistency checks.
+    '''
+
+    neighbors = {name: [] for name in keypoints_names}
+    for point_a, point_b in BONE_PAIRS:
+        if point_a in neighbors and point_b in neighbors:
+            neighbors[point_a].append(point_b)
+            neighbors[point_b].append(point_a)
+    return neighbors
+
+
+def update_bone_history(bone_history, keypoints_names, q_points):
+    '''
+    Keep a short history of valid 3D bone lengths for scoring.
+    '''
+
+    if bone_history is None:
+        bone_history = {}
+
+    keypoint_to_idx = {name: idx for idx, name in enumerate(keypoints_names)}
+    q_points = np.asarray(q_points, dtype=float)
+    for point_a, point_b in BONE_PAIRS:
+        if point_a not in keypoint_to_idx or point_b not in keypoint_to_idx:
+            continue
+        q_a = q_points[keypoint_to_idx[point_a]]
+        q_b = q_points[keypoint_to_idx[point_b]]
+        if not np.all(np.isfinite(q_a)) or not np.all(np.isfinite(q_b)):
+            continue
+
+        pair_key = tuple(sorted((point_a, point_b)))
+        bone_history.setdefault(pair_key, [])
+        bone_history[pair_key].append(float(np.linalg.norm(q_a - q_b)))
+        bone_history[pair_key] = bone_history[pair_key][-20:]
+
+    return bone_history
+
+
+def compute_candidate_score(config_dict, keypoint_name, q_candidate, reprojection_error, nb_cams_excluded,
+                            previous_point=None, current_points_3d=None, current_point_names=None,
+                            bone_history=None, keypoint_neighbors=None):
+    '''
+    Combine reprojection, temporal continuity, bone consistency, and camera-drop penalties.
+    '''
+
+    temporal_cfg = config_dict.get('triangulation', {}).get('temporal', {})
+    bone_cfg = config_dict.get('triangulation', {}).get('bone_consistency', {})
+
+    score = float(reprojection_error)
+
+    if temporal_cfg.get('enabled', True) and previous_point is not None and np.all(np.isfinite(previous_point)) and np.all(np.isfinite(q_candidate)):
+        distance_weight = float(temporal_cfg.get('distance_weight', 1.0))
+        temporal_scale = float(temporal_cfg.get('distance_scale', 50.0))
+        strict_keypoints = set(temporal_cfg.get('keypoints_strict', list(STRICT_TRAJECTORY_KEYPOINTS)))
+        strict_multiplier = float(temporal_cfg.get('strict_multiplier', 1.5))
+        penalty = np.linalg.norm(np.asarray(q_candidate) - np.asarray(previous_point)) * temporal_scale
+        if keypoint_name in strict_keypoints:
+            penalty *= strict_multiplier
+        score += distance_weight * penalty
+
+    score += float(config_dict.get('triangulation', {}).get('camera_drop_penalty', 0.5)) * nb_cams_excluded
+
+    if not bone_cfg.get('enabled', True):
+        return score
+
+    if bone_history is None or current_points_3d is None or current_point_names is None:
+        return score
+
+    keypoint_neighbors = keypoint_neighbors or {}
+    length_weight = float(bone_cfg.get('length_weight', 1.0))
+    reject_ratio = float(bone_cfg.get('reject_if_ratio_exceeds', 1.35))
+    length_scale = float(bone_cfg.get('length_scale', 20.0))
+    name_to_index = {name: idx for idx, name in enumerate(current_point_names)}
+    for neighbor_name in keypoint_neighbors.get(keypoint_name, []):
+        neighbor_idx = name_to_index.get(neighbor_name)
+        if neighbor_idx is None or neighbor_idx >= len(current_points_3d):
+            continue
+        neighbor_point = np.asarray(current_points_3d[neighbor_idx], dtype=float)
+        if not np.all(np.isfinite(neighbor_point)):
+            continue
+
+        pair_key = tuple(sorted((keypoint_name, neighbor_name)))
+        reference_lengths = bone_history.get(pair_key, [])
+        if len(reference_lengths) == 0:
+            continue
+        reference_length = float(np.median(reference_lengths))
+        if reference_length <= 1e-6:
+            continue
+
+        current_length = float(np.linalg.norm(np.asarray(q_candidate) - neighbor_point))
+        length_ratio = max(current_length / reference_length, reference_length / max(current_length, 1e-9))
+        if length_ratio > reject_ratio:
+            return np.inf
+        score += length_weight * abs(current_length - reference_length) / reference_length * length_scale
+
+    return score
 
 
 def make_trc(config_dict, Q, keypoints_names, id_person=-1):
@@ -270,10 +630,7 @@ def recap_triangulate(config_dict, error, nb_cams_excluded, keypoints_names, cam
 
     # Read config_dict
     project_dir = config_dict.get('project').get('project_dir')
-    # if batch
-    session_dir = os.path.realpath(os.path.join(project_dir, '..'))
-    # if single trial
-    session_dir = session_dir if 'Config.toml' in os.listdir(session_dir) else os.getcwd()
+    session_dir = resolve_session_dir(project_dir)
     calib_dir = [os.path.join(session_dir, c) for c in os.listdir(session_dir) if os.path.isdir(os.path.join(session_dir, c)) and  'calib' in c.lower()][0]
     calib_files = glob.glob(os.path.join(calib_dir, '*.toml'))
     calib_file = max(calib_files, key=os.path.getctime) # lastly created calibration file
@@ -360,7 +717,9 @@ def recap_triangulate(config_dict, error, nb_cams_excluded, keypoints_names, cam
     logging.info(f'Lens distortions were {"taken into account" if undistort_points else "not taken into account"}.')
 
 
-def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_swapped, projection_matrices, calib_params):
+def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_swapped, projection_matrices, calib_params,
+                                    keypoint_name=None, previous_point_3d=None, current_points_3d=None,
+                                    current_point_names=None, bone_history=None, keypoint_neighbors=None):
     '''
     Triangulates 2D keypoint coordinates. If reprojection error is above threshold,
     tries swapping left and right sides. If still above, removes a camera until error
@@ -386,9 +745,12 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
     '''
     
     # Read config_dict
-    error_threshold_triangulation = config_dict.get('triangulation').get('reproj_error_threshold_triangulation')
+    error_threshold_triangulation = get_reprojection_threshold(config_dict, keypoint_name)
     min_cameras_for_triangulation = config_dict.get('triangulation').get('min_cameras_for_triangulation')
     handle_LR_swap = config_dict.get('triangulation').get('handle_LR_swap')
+    allowed_lr_swap = set(config_dict.get('triangulation', {}).get('lr_swap_keypoints', list(DEFAULT_LR_SWAP_KEYPOINTS)))
+    if keypoint_name is not None and keypoint_name not in allowed_lr_swap:
+        handle_LR_swap = False
 
     undistort_points = config_dict.get('triangulation').get('undistort_points')
     if undistort_points:
@@ -401,14 +763,15 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
     x_files, y_files, likelihood_files = coords_2D_kpt
     x_files_swapped, y_files_swapped, likelihood_files_swapped = coords_2D_kpt_swapped
     n_cams = len(x_files)
-    error_min = np.inf 
+    error_min = np.inf
+    best_score = np.inf
     
     nb_cams_off = 0 # cameras will be taken-off until reprojection error is under threshold
     # print('\n')
     while error_min > error_threshold_triangulation and n_cams - nb_cams_off >= min_cameras_for_triangulation:
         # print("error min ", error_min, "thresh ", error_threshold_triangulation, 'nb_cams_off ', nb_cams_off)
         # Create subsets with "nb_cams_off" cameras excluded
-        id_cams_off = np.array(list(it.combinations(range(n_cams), nb_cams_off)))
+        id_cams_off = cached_camera_combinations(n_cams, nb_cams_off)
         
         if undistort_points:
             calib_params_K_filt = [calib_params_K]*len(id_cams_off)
@@ -425,11 +788,12 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
         
         if nb_cams_off > 0:
             for i in range(len(id_cams_off)):
-                x_files_filt[i][id_cams_off[i]] = np.nan
-                y_files_filt[i][id_cams_off[i]] = np.nan
-                x_files_swapped_filt[i][id_cams_off[i]] = np.nan
-                y_files_swapped_filt[i][id_cams_off[i]] = np.nan
-                likelihood_files_filt[i][id_cams_off[i]] = np.nan
+                excluded_idx = list(id_cams_off[i])
+                x_files_filt[i][excluded_idx] = np.nan
+                y_files_filt[i][excluded_idx] = np.nan
+                x_files_swapped_filt[i][excluded_idx] = np.nan
+                y_files_swapped_filt[i][excluded_idx] = np.nan
+                likelihood_files_filt[i][excluded_idx] = np.nan
         
         # Excluded cameras index and count
         id_cams_off_tot_new = [np.argwhere(np.isnan(x)).ravel() for x in likelihood_files_filt]
@@ -484,9 +848,9 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
         # Reprojection error
         error = []
         for config_off_id in range(len(x_calc_filt)):
-            q_file = [(x_files_filt[config_off_id][i], y_files_filt[config_off_id][i]) for i in range(len(x_files_filt[config_off_id]))]
-            q_calc = [(x_calc_filt[config_off_id][i], y_calc_filt[config_off_id][i]) for i in range(len(x_calc_filt[config_off_id]))]
-            error.append( np.mean( [euclidean_distance(q_file[i], q_calc[i]) for i in range(len(q_file))] ) )
+            dx = np.asarray(x_files_filt[config_off_id]) - np.asarray(x_calc_filt[config_off_id], dtype=float)
+            dy = np.asarray(y_files_filt[config_off_id]) - np.asarray(y_calc_filt[config_off_id], dtype=float)
+            error.append(np.mean(np.hypot(dx, dy)))
         # print('error ', error)
             
         # Choosing best triangulation (with min reprojection error)
@@ -497,9 +861,24 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
         # print('len(id_cams_off_tot) ', len(id_cams_off_tot))
         # print('min error ', np.nanmin(error))
         # print('argmin error ', np.nanargmin(error))
-        error_min = np.nanmin(error)
-        # print(error_min)
-        best_cams = np.nanargmin(error)
+        scores = [
+            compute_candidate_score(
+                config_dict,
+                keypoint_name,
+                Q_filt[idx][:-1],
+                error[idx],
+                nb_cams_excluded_filt[idx],
+                previous_point=previous_point_3d,
+                current_points_3d=current_points_3d,
+                current_point_names=current_point_names,
+                bone_history=bone_history,
+                keypoint_neighbors=keypoint_neighbors
+            )
+            for idx in range(len(error))
+        ]
+        best_cams = int(np.nanargmin(scores))
+        best_score = scores[best_cams]
+        error_min = error[best_cams]
         nb_cams_excluded = nb_cams_excluded_filt[best_cams]
         
         Q = Q_filt[best_cams][:-1]
@@ -513,7 +892,7 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
             while error_off_swap_min > error_threshold_triangulation and n_cams_swapped < (n_cams - nb_cams_off_tot) / 2: # more than half of the cameras switched: may triangulate twice the same side
                 # print('SWAP: nb_cams_off ', nb_cams_off, 'n_cams_swapped ', n_cams_swapped, 'nb_cams_off_tot ', nb_cams_off_tot)
                 # Create subsets 
-                id_cams_swapped = np.array(list(it.combinations(range(n_cams-nb_cams_off_tot), n_cams_swapped)))
+                id_cams_swapped = cached_camera_combinations(n_cams-nb_cams_off_tot, n_cams_swapped)
                 # print('id_cams_swapped ', id_cams_swapped)
                 x_files_filt_off_swap = [[x] * len(id_cams_swapped) for x in x_files_filt]
                 y_files_filt_off_swap = [[y] * len(id_cams_swapped) for y in y_files_filt]
@@ -554,18 +933,30 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
                 for id_off in range(len(id_cams_off)):
                     error_percam = []
                     for id_swapped, config_swapped in enumerate(id_cams_swapped):
-                        # print(id_off,id_swapped,n_cams,nb_cams_off)
-                        # print(repr(x_files_filt_off_swap))
-                        q_file_off_swap = [(x_files_filt_off_swap[id_off][id_swapped][i], y_files_filt_off_swap[id_off][id_swapped][i]) for i in range(n_cams - nb_cams_off_tot)]
-                        q_calc_off_swap = [(x_calc_off_swap[id_off][id_swapped][i], y_calc_off_swap[id_off][id_swapped][i]) for i in range(n_cams - nb_cams_off_tot)]
-                        error_percam.append( np.mean( [euclidean_distance(q_file_off_swap[i], q_calc_off_swap[i]) for i in range(len(q_file_off_swap))] ) )
+                        dx = np.asarray(x_files_filt_off_swap[id_off][id_swapped]) - np.asarray(x_calc_off_swap[id_off][id_swapped], dtype=float)
+                        dy = np.asarray(y_files_filt_off_swap[id_off][id_swapped]) - np.asarray(y_calc_off_swap[id_off][id_swapped], dtype=float)
+                        error_percam.append(np.mean(np.hypot(dx, dy)))
                     error_off_swap.append(error_percam)
                 error_off_swap = np.array(error_off_swap)
-                # print('error_off_swap ', error_off_swap)
-                
-                # Choosing best triangulation (with min reprojection error)
-                error_off_swap_min = np.min(error_off_swap)
-                best_off_swap_config = np.unravel_index(error_off_swap.argmin(), error_off_swap.shape)
+                score_off_swap = np.full(error_off_swap.shape, np.inf, dtype=float)
+                for id_off in range(len(id_cams_off)):
+                    for id_swapped in range(len(id_cams_swapped)):
+                        score_off_swap[id_off, id_swapped] = compute_candidate_score(
+                            config_dict,
+                            keypoint_name,
+                            Q_filt_off_swap[id_off][id_swapped][:-1],
+                            error_off_swap[id_off, id_swapped],
+                            nb_cams_excluded_filt[id_off],
+                            previous_point=previous_point_3d,
+                            current_points_3d=current_points_3d,
+                            current_point_names=current_point_names,
+                            bone_history=bone_history,
+                            keypoint_neighbors=keypoint_neighbors
+                        )
+
+                best_off_swap_config = np.unravel_index(np.argmin(score_off_swap), score_off_swap.shape)
+                error_off_swap_min = error_off_swap[best_off_swap_config]
+                best_off_swap_score = score_off_swap[best_off_swap_config]
                 
                 id_off_cams = best_off_swap_config[0]
                 id_swapped_cams = id_cams_swapped[best_off_swap_config[1]]
@@ -573,7 +964,8 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
 
                 n_cams_swapped += 1
 
-            if error_off_swap_min < error_min:
+            if best_off_swap_score < best_score:
+                best_score = best_off_swap_score
                 error_min = error_off_swap_min
                 best_cams = id_off_cams
                 Q = Q_best
@@ -676,10 +1068,7 @@ def triangulate_all(config_dict):
     
     # Read config_dict
     project_dir = config_dict.get('project').get('project_dir')
-    # if batch
-    session_dir = os.path.realpath(os.path.join(project_dir, '..'))
-    # if single trial
-    session_dir = session_dir if 'Config.toml' in os.listdir(session_dir) else os.getcwd()
+    session_dir = resolve_session_dir(project_dir)
     multi_person = config_dict.get('project').get('multi_person')
     pose_model = config_dict.get('pose').get('pose_model')
     frame_range = config_dict.get('project').get('frame_range')
@@ -725,9 +1114,7 @@ def triangulate_all(config_dict):
         model = eval(pose_model)
     except:
         try: # from Config.toml
-            model = DictImporter().import_(config_dict.get('pose').get(pose_model))
-            if model.id == 'None':
-                model.id = None
+            model = import_pose_model_from_config(config_dict, pose_model)
         except:
             raise NameError('{pose_model} not found in skeletons.py nor in Config.toml')
             
@@ -735,6 +1122,7 @@ def triangulate_all(config_dict):
     keypoints_names = [node.name for _, _, node in RenderTree(model) if node.id!=None]
     keypoints_idx = list(range(len(keypoints_ids)))
     keypoints_nb = len(keypoints_ids)
+    keypoint_neighbors = build_keypoint_neighbors(keypoints_names)
     # for pre, _, node in RenderTree(model): 
     #     print(f'{pre}{node.name} id={node.id}')
     
@@ -787,6 +1175,8 @@ def triangulate_all(config_dict):
 
     Q = [[[np.nan]*3]*keypoints_nb for n in range(nb_persons_to_detect)]
     Q_old = [[[np.nan]*3]*keypoints_nb for n in range(nb_persons_to_detect)]
+    prev_coords_2d = [None for _ in range(nb_persons_to_detect)]
+    bone_histories = [dict() for _ in range(nb_persons_to_detect)]
     error = [[] for n in range(nb_persons_to_detect)]
     nb_cams_excluded = [[] for n in range(nb_persons_to_detect)]
     id_excluded_cams = [[] for n in range(nb_persons_to_detect)]
@@ -819,6 +1209,17 @@ def triangulate_all(config_dict):
                 x_files[n][likelihood_files[n] < likelihood_threshold] = np.nan
                 y_files[n][likelihood_files[n] < likelihood_threshold] = np.nan
                 likelihood_files[n][likelihood_files[n] < likelihood_threshold] = np.nan
+
+        for n in range(nb_persons_to_detect):
+            prev_coords = None if multi_person else prev_coords_2d[n]
+            x_files[n], y_files[n], likelihood_files[n] = clean_2d_keypoints(
+                config_dict,
+                keypoints_names,
+                x_files[n],
+                y_files[n],
+                likelihood_files[n],
+                prev_coords=prev_coords
+            )
         
         # Q_old = Q except when it has nan, otherwise it takes the Q_old value
         nan_mask = np.isnan(Q)
@@ -836,13 +1237,35 @@ def triangulate_all(config_dict):
                 # print('\n', keypoints_names[keypoint_idx])
                 coords_2D_kpt = np.array( (x_files[n][:, keypoint_idx], y_files[n][:, keypoint_idx], likelihood_files[n][:, keypoint_idx]) )
                 coords_2D_kpt_swapped = np.array(( x_files[n][:, keypoints_idx_swapped[keypoint_idx]], y_files[n][:, keypoints_idx_swapped[keypoint_idx]], likelihood_files[n][:, keypoints_idx_swapped[keypoint_idx]] ))
+                previous_point_3d = np.asarray(Q_old[n][keypoint_idx], dtype=float)
+                if not np.all(np.isfinite(previous_point_3d)):
+                    previous_point_3d = None
 
-                Q_kpt, error_kpt, nb_cams_excluded_kpt, id_excluded_cams_kpt = triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_swapped, P, calib_params) # P has been modified if undistort_points=True
+                Q_kpt, error_kpt, nb_cams_excluded_kpt, id_excluded_cams_kpt = triangulation_from_best_cameras(
+                    config_dict,
+                    coords_2D_kpt,
+                    coords_2D_kpt_swapped,
+                    P,
+                    calib_params,
+                    keypoint_name=keypoints_names[keypoint_idx],
+                    previous_point_3d=previous_point_3d,
+                    current_points_3d=Q[n],
+                    current_point_names=keypoints_names,
+                    bone_history=bone_histories[n],
+                    keypoint_neighbors=keypoint_neighbors
+                ) # P has been modified if undistort_points=True
 
                 Q[n].append(Q_kpt)
                 error[n].append(error_kpt)
                 nb_cams_excluded[n].append(nb_cams_excluded_kpt)
                 id_excluded_cams[n].append(id_excluded_cams_kpt)
+
+            prev_coords_2d[n] = (
+                np.array(x_files[n], copy=True),
+                np.array(y_files[n], copy=True),
+                np.array(likelihood_files[n], copy=True)
+            )
+            bone_histories[n] = update_bone_history(bone_histories[n], keypoints_names, Q[n])
         
         if multi_person:
             # reID persons across frames by checking the distance from one frame to another

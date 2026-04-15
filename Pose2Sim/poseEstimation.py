@@ -77,6 +77,257 @@ __status__ = "Development"
 
 
 ## FUNCTIONS
+def get_keypoint_id(model, keypoint_name, default=0):
+    '''
+    Resolve a keypoint name to its skeleton id.
+    '''
+
+    try:
+        return [node.id for _, _, node in RenderTree(model) if node.name == keypoint_name][0]
+    except Exception:
+        logging.warning(f'{keypoint_name} not found in the current pose model. Falling back to keypoint id {default}.')
+        return default
+
+
+def build_person_filter_config(config_dict, pose_model):
+    '''
+    Normalize person filtering configuration.
+    '''
+
+    filter_cfg = config_dict.get('pose', {}).get('person_filter', {}) or {}
+    anchor_keypoint = filter_cfg.get('anchor_keypoint', 'Neck')
+    anchor_keypoint_id = None if str(anchor_keypoint).lower() == 'bbox_center' else get_keypoint_id(pose_model, anchor_keypoint, default=0)
+    return {
+        'enabled': bool(filter_cfg.get('enabled', False)),
+        'max_people': max(1, int(filter_cfg.get('max_people', 1))),
+        'anchor_keypoint': anchor_keypoint,
+        'anchor_keypoint_id': anchor_keypoint_id,
+        'min_mean_score': float(filter_cfg.get('min_mean_score', 0.2)),
+        'min_bbox_area_px': float(filter_cfg.get('min_bbox_area_px', 0)),
+        'max_bbox_area_px': float(filter_cfg.get('max_bbox_area_px', float('inf'))),
+        'roi_by_camera': filter_cfg.get('roi_by_camera', {}) or {},
+    }
+
+
+def _source_lookup_keys(source_name):
+    stem = os.path.splitext(os.path.basename(source_name))[0]
+    prefix = stem.split('_')[0]
+    return [stem, prefix]
+
+
+def _roi_for_source(source_name, roi_by_camera):
+    for key in _source_lookup_keys(source_name):
+        if key in roi_by_camera:
+            return roi_by_camera[key]
+    return None
+
+
+def _anchor_points_from_keypoints(keypoints, bboxes, anchor_keypoint_id):
+    if len(keypoints) == 0:
+        return np.empty((0, 2))
+    centers = np.column_stack(((bboxes[:, 0] + bboxes[:, 2]) / 2, (bboxes[:, 1] + bboxes[:, 3]) / 2))
+    if anchor_keypoint_id is None:
+        return centers
+    anchors = keypoints[:, anchor_keypoint_id, :] if anchor_keypoint_id < keypoints.shape[1] else np.full((len(keypoints), 2), np.nan)
+    valid_mask = np.all(np.isfinite(anchors), axis=1)
+    anchors = anchors.copy()
+    anchors[~valid_mask] = centers[~valid_mask]
+    return anchors
+
+
+def _points_in_roi(points, roi):
+    if roi is None or len(roi) != 4 or len(points) == 0:
+        return np.ones(len(points), dtype=bool)
+    x_min, y_min, x_max, y_max = roi
+    return (
+        (points[:, 0] >= x_min) &
+        (points[:, 0] <= x_max) &
+        (points[:, 1] >= y_min) &
+        (points[:, 1] <= y_max)
+    )
+
+
+def filter_person_detections(keypoints, scores, frame_shape, source_name, person_filter_cfg, prev_anchor=None):
+    '''
+    Apply ROI and single-person filtering after tracking.
+    '''
+
+    if not person_filter_cfg.get('enabled', False):
+        return keypoints, scores, prev_anchor, None
+
+    keypoints = np.asarray(keypoints)
+    scores = np.asarray(scores)
+    if keypoints.size == 0 or len(keypoints) == 0:
+        return keypoints[:0], scores[:0], prev_anchor, {'total': 0, 'kept': 0}
+
+    bboxes = bbox_xyxy_compute(frame_shape, keypoints, padding=0)
+    mean_scores = np.nanmean(scores, axis=1)
+    bbox_area = np.clip(bboxes[:, 2] - bboxes[:, 0], 0, None) * np.clip(bboxes[:, 3] - bboxes[:, 1], 0, None)
+    anchor_points = _anchor_points_from_keypoints(keypoints, bboxes, person_filter_cfg['anchor_keypoint_id'])
+    roi = _roi_for_source(source_name, person_filter_cfg.get('roi_by_camera', {}))
+    roi_mask = _points_in_roi(anchor_points, roi)
+
+    img_h, img_w = frame_shape[:2]
+    bbox_in_image = (
+        (bboxes[:, 0] >= 0) &
+        (bboxes[:, 1] >= 0) &
+        (bboxes[:, 2] <= img_w) &
+        (bboxes[:, 3] <= img_h)
+    )
+
+    keep_mask = np.isfinite(mean_scores)
+    keep_mask &= bbox_in_image
+    keep_mask &= mean_scores >= person_filter_cfg['min_mean_score']
+    keep_mask &= bbox_area >= person_filter_cfg['min_bbox_area_px']
+    keep_mask &= bbox_area <= person_filter_cfg['max_bbox_area_px']
+    keep_mask &= roi_mask
+
+    keep_indices = np.where(keep_mask)[0]
+    if len(keep_indices) == 0:
+        return keypoints[:0], scores[:0], prev_anchor, {'total': len(keypoints), 'kept': 0}
+
+    if prev_anchor is None or not np.all(np.isfinite(prev_anchor)):
+        distances = np.full(len(keep_indices), np.inf)
+    else:
+        distances = np.linalg.norm(anchor_points[keep_indices] - prev_anchor, axis=1)
+
+    order = np.lexsort((
+        -mean_scores[keep_indices],
+        -bbox_area[keep_indices],
+        distances,
+    ))
+    keep_indices = keep_indices[order][:person_filter_cfg['max_people']]
+    filtered_keypoints = keypoints[keep_indices]
+    filtered_scores = scores[keep_indices]
+    next_anchor = anchor_points[keep_indices[0]] if len(keep_indices) > 0 else prev_anchor
+
+    return filtered_keypoints, filtered_scores, next_anchor, {'total': len(keypoints), 'kept': len(filtered_keypoints)}
+
+
+def _batch_onnx_inference(session, batch_input):
+    '''
+    Run ONNX inference with batch_input of shape (N, 3, H, W).
+    Bypasses rtmlib's single-frame inference to enable GPU batching.
+
+    Returns list of output arrays, each with batch dimension N.
+    '''
+
+    sess_input = {session.get_inputs()[0].name: batch_input}
+    sess_output = [out.name for out in session.get_outputs()]
+    return session.run(sess_output, sess_input)
+
+
+def batch_detection(det_model, frames):
+    '''
+    Run person detection on multiple frames in a single GPU batch.
+
+    INPUTS:
+    - det_model: RTMDet model object (from pose_tracker.det_model)
+    - frames: list of BGR numpy arrays (raw video frames)
+
+    OUTPUTS:
+    - list of per-frame bounding boxes (same format as det_model.__call__)
+    '''
+
+    if len(frames) == 0:
+        return []
+
+    preprocessed = []
+    ratios = []
+    for frame in frames:
+        img, ratio = det_model.preprocess(frame)
+        img = img.transpose(2, 0, 1)  # HWC -> CHW
+        preprocessed.append(img)
+        ratios.append(ratio)
+
+    batch_input = np.stack(preprocessed, axis=0).astype(np.float32)  # (N, 3, 640, 640)
+    outputs = _batch_onnx_inference(det_model.session, batch_input)
+
+    # outputs[0] shape: (N, num_anchors, 5) for models with NMS, or (N, num_anchors, 4+classes) without
+    results = []
+    for i in range(len(frames)):
+        # Extract single-frame output and call original postprocess
+        frame_output = outputs[0][i:i+1]  # keep batch dim for postprocess compatibility
+        bboxes = det_model.postprocess(frame_output, ratios[i])
+        results.append(bboxes)
+
+    return results
+
+
+def batch_pose_topdown(pose_model, frames, per_frame_bboxes, max_batch_crops=128):
+    '''
+    Run top-down pose estimation on multiple frames' bounding boxes in batched GPU calls.
+
+    INPUTS:
+    - pose_model: RTMPose model object (from pose_tracker.pose_model)
+    - frames: list of BGR numpy arrays
+    - per_frame_bboxes: list of bbox arrays, one per frame
+    - max_batch_crops: max crops per ONNX call to limit VRAM usage
+
+    OUTPUTS:
+    - list of (keypoints, scores) tuples, one per frame
+      keypoints shape: (num_persons, num_keypoints, 2)
+      scores shape: (num_persons, num_keypoints)
+    '''
+
+    # Collect all crops across all frames
+    all_crops = []
+    all_centers = []
+    all_scales = []
+    frame_indices = []  # which frame each crop belongs to
+
+    for fi, (frame, bboxes) in enumerate(zip(frames, per_frame_bboxes)):
+        if len(bboxes) == 0:
+            bboxes = [[0, 0, frame.shape[1], frame.shape[0]]]
+        for bbox in bboxes:
+            img, center, scale = pose_model.preprocess(frame, bbox)
+            img = img.transpose(2, 0, 1)  # HWC -> CHW
+            all_crops.append(img)
+            all_centers.append(center)
+            all_scales.append(scale)
+            frame_indices.append(fi)
+
+    if len(all_crops) == 0:
+        return [(np.empty((0, 0, 2)), np.empty((0, 0))) for _ in frames]
+
+    # Run inference in sub-batches to limit VRAM
+    all_simcc_x = []
+    all_simcc_y = []
+    for start in range(0, len(all_crops), max_batch_crops):
+        end = min(start + max_batch_crops, len(all_crops))
+        batch_input = np.stack(all_crops[start:end], axis=0).astype(np.float32)
+        outputs = _batch_onnx_inference(pose_model.session, batch_input)
+        all_simcc_x.append(outputs[0])
+        all_simcc_y.append(outputs[1])
+
+    simcc_x = np.concatenate(all_simcc_x, axis=0)  # (total_crops, K, Wx)
+    simcc_y = np.concatenate(all_simcc_y, axis=0)  # (total_crops, K, Wy)
+
+    # Batch postprocess: get_simcc_maximum handles (N, K, Wx) natively
+    from rtmlib.tools.pose_estimation.post_processings import get_simcc_maximum
+    simcc_split_ratio = 2.0
+    locs, scores = get_simcc_maximum(simcc_x, simcc_y)
+    keypoints_all = locs / simcc_split_ratio
+
+    # Rescale each crop's keypoints back to image coordinates
+    centers = np.array(all_centers)   # (total_crops, 2)
+    scales = np.array(all_scales)     # (total_crops, 2)
+    model_input_size = np.array(pose_model.model_input_size)
+    keypoints_all = keypoints_all / model_input_size * scales[:, np.newaxis, :]
+    keypoints_all = keypoints_all + centers[:, np.newaxis, :] - scales[:, np.newaxis, :] / 2
+
+    # Group by frame
+    results = []
+    for fi in range(len(frames)):
+        mask = [j for j, idx in enumerate(frame_indices) if idx == fi]
+        if mask:
+            results.append((keypoints_all[mask], scores[mask]))
+        else:
+            results.append((np.empty((0, keypoints_all.shape[1], 2)), np.empty((0, keypoints_all.shape[1]))))
+
+    return results
+
+
 def setup_pose_tracker(ModelClass, det_frequency, mode, tracking, backend, device):
     '''
     Set up the RTMLib pose tracker with the appropriate model and backend.
@@ -279,7 +530,7 @@ def save_to_openpose(json_file_path, keypoints, scores):
         json.dump(json_output, json_file)
 
 
-def process_video(video_path, pose_tracker, pose_model, output_format, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker):
+def process_video(video_path, pose_tracker, pose_model, output_format, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker, person_filter_cfg):
     '''
     Estimate pose from a video file
     
@@ -333,6 +584,8 @@ def process_video(video_path, pose_tracker, pose_model, output_format, save_vide
     f_range = [[0,total_frames] if frame_range in ('all', 'auto', []) else frame_range][0]
     cap.set(cv2.CAP_PROP_POS_FRAMES, f_range[0])
     frame_idx = f_range[0]
+    prev_anchor = None
+    filter_stats = {'frames': 0, 'detections_before': 0, 'detections_after': 0, 'frames_multi_before': 0, 'frames_multi_after': 0, 'frames_empty_after': 0}
 
     # Retrieve keypoint names from model
     keypoints_ids = [node.id for _, _, node in RenderTree(pose_model) if node.id!=None]
@@ -378,6 +631,22 @@ def process_video(video_path, pose_tracker, pose_model, output_format, save_vide
                         prev_keypoints, keypoints, scores = sort_people_sports2d(prev_keypoints, keypoints, scores=scores, max_dist=max_distance_px)
                     else:
                         pass
+
+                    keypoints, scores, prev_anchor, stats = filter_person_detections(
+                        keypoints,
+                        scores,
+                        frame_shape,
+                        video_path,
+                        person_filter_cfg,
+                        prev_anchor=prev_anchor,
+                    )
+                    if stats is not None:
+                        filter_stats['frames'] += 1
+                        filter_stats['detections_before'] += stats['total']
+                        filter_stats['detections_after'] += stats['kept']
+                        filter_stats['frames_multi_before'] += int(stats['total'] > 1)
+                        filter_stats['frames_multi_after'] += int(stats['kept'] > 1)
+                        filter_stats['frames_empty_after'] += int(stats['kept'] == 0)
 
                 except:
                     keypoints = np.full((1,kpt_id_max,2), fill_value=np.nan)
@@ -433,12 +702,230 @@ def process_video(video_path, pose_tracker, pose_model, output_format, save_vide
         logging.info(f"--> Output images saved to {img_output_dir}.")
     if display_detection:
         cv2.destroyAllWindows()
+    if person_filter_cfg.get('enabled', False) and filter_stats['frames'] > 0:
+        logging.info(
+            f'Person filter summary for {os.path.basename(video_path)}: '
+            f'mean detections/frame {filter_stats["detections_before"]/filter_stats["frames"]:.2f} -> '
+            f'{filter_stats["detections_after"]/filter_stats["frames"]:.2f}, '
+            f'frames with >1 detection {filter_stats["frames_multi_before"]} -> {filter_stats["frames_multi_after"]}, '
+            f'empty frames after filter {filter_stats["frames_empty_after"]}.'
+        )
 
 
-def process_images(image_folder_path, vid_img_extension, pose_tracker, pose_model, output_format, fps, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker):
+def process_video_batched(video_path, det_model, pose_model_onnx, pose_model_tree, batch_size, det_frequency,
+                          output_format, save_video, save_images, display_detection, frame_range,
+                          tracking_mode, max_distance_px, deepsort_tracker, person_filter_cfg):
+    '''
+    Estimate pose from a video file using GPU batch inference.
+    Reads batch_size frames at a time, runs detection and pose estimation in batch,
+    then applies NMS/tracking/person_filter sequentially per frame.
+
+    INPUTS:
+    - video_path: str. Path to the input video file
+    - det_model: RTMDet model object (pose_tracker.det_model) for batch detection
+    - pose_model_onnx: RTMPose model object (pose_tracker.pose_model) for batch pose estimation
+    - pose_model_tree: anytree model. Skeleton tree for drawing/keypoint info
+    - batch_size: int. Number of frames to process in a single GPU batch
+    - det_frequency: int. Run detection every N frames, reuse bboxes in between
+    - output_format, save_video, save_images, display_detection, frame_range,
+      tracking_mode, max_distance_px, deepsort_tracker, person_filter_cfg: same as process_video
+    '''
+
+    cap = cv2.VideoCapture(video_path)
+    cap.read()
+    if cap.read()[0] == False:
+        raise NameError(f"{video_path} is not a video. Images must be put in one subdirectory per camera.")
+
+    pose_dir = os.path.abspath(os.path.join(video_path, '..', '..', 'pose'))
+    if not os.path.isdir(pose_dir): os.makedirs(pose_dir)
+    video_name_wo_ext = os.path.splitext(os.path.basename(video_path))[0]
+    json_output_dir = os.path.join(pose_dir, f'{video_name_wo_ext}_json')
+    output_video_path = os.path.join(pose_dir, f'{video_name_wo_ext}_pose.mp4')
+    img_output_dir = os.path.join(pose_dir, f'{video_name_wo_ext}_img')
+
+    W, H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if save_video:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps = round(cap.get(cv2.CAP_PROP_FPS))
+        out = cv2.VideoWriter(output_video_path, fourcc, fps, (W, H))
+
+    if display_detection:
+        screen_width, screen_height = get_screen_size()
+        display_width, display_height = calculate_display_size(W, H, screen_width, screen_height, margin=50)
+        cv2.namedWindow(f"Pose Estimation {os.path.basename(video_path)}", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(f"Pose Estimation {os.path.basename(video_path)}", display_width, display_height)
+
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    f_range = [[0, total_frames] if frame_range in ('all', 'auto', []) else frame_range][0]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, f_range[0])
+    frame_idx = f_range[0]
+    prev_anchor = None
+    filter_stats = {'frames': 0, 'detections_before': 0, 'detections_after': 0, 'frames_multi_before': 0, 'frames_multi_after': 0, 'frames_empty_after': 0}
+
+    keypoints_ids = [node.id for _, _, node in RenderTree(pose_model_tree) if node.id != None]
+    kpt_id_max = max(keypoints_ids) + 1
+
+    cached_bboxes = [[0, 0, W, H]]  # fallback bboxes for det_frequency skip frames
+    quit_flag = False
+
+    with tqdm(iterable=range(*f_range), desc=f'Processing {os.path.basename(video_path)} (batch={batch_size})') as pbar:
+        while cap.isOpened() and frame_idx < f_range[1] and not quit_flag:
+            # 1. Read a batch of frames
+            batch_frames = []
+            batch_frame_indices = []
+            for _ in range(batch_size):
+                if frame_idx >= f_range[1]:
+                    break
+                success, frame = cap.read()
+                if not success:
+                    break
+                batch_frames.append(frame)
+                batch_frame_indices.append(frame_idx)
+                frame_idx += 1
+
+            if len(batch_frames) == 0:
+                break
+
+            # 2. Batch detection: only detect on frames where frame_idx % det_frequency == 0
+            det_frame_positions = []  # indices within batch that need detection
+            det_frames_list = []
+            for i, fidx in enumerate(batch_frame_indices):
+                if fidx % det_frequency == 0:
+                    det_frame_positions.append(i)
+                    det_frames_list.append(batch_frames[i])
+
+            if det_frames_list:
+                try:
+                    det_results = batch_detection(det_model, det_frames_list)
+                except:
+                    det_results = [cached_bboxes] * len(det_frames_list)
+
+            # Assign bboxes to each frame in the batch
+            per_frame_bboxes = []
+            det_result_idx = 0
+            for i in range(len(batch_frames)):
+                if i in det_frame_positions:
+                    bboxes = det_results[det_result_idx]
+                    det_result_idx += 1
+                    if len(bboxes) > 0:
+                        cached_bboxes = bboxes
+                    per_frame_bboxes.append(bboxes if len(bboxes) > 0 else cached_bboxes)
+                else:
+                    per_frame_bboxes.append(cached_bboxes)
+
+            # 3. Batch pose estimation
+            try:
+                per_frame_results = batch_pose_topdown(pose_model_onnx, batch_frames, per_frame_bboxes)
+            except:
+                per_frame_results = [
+                    (np.full((1, kpt_id_max, 2), fill_value=np.nan), np.full((1, kpt_id_max), fill_value=np.nan))
+                    for _ in batch_frames
+                ]
+
+            # 4. Sequential post-processing per frame
+            for i, frame in enumerate(batch_frames):
+                fidx = batch_frame_indices[i]
+                keypoints, scores = per_frame_results[i]
+
+                try:
+                    # NMS
+                    frame_shape = frame.shape
+                    if len(keypoints) > 0 and keypoints.size > 0:
+                        mask_scores = np.mean(scores, axis=1) > 0.2
+                        likely_keypoints = np.where(mask_scores[:, np.newaxis, np.newaxis], keypoints, np.nan)
+                        likely_scores = np.where(mask_scores[:, np.newaxis], scores, np.nan)
+                        likely_bboxes = bbox_xyxy_compute(frame_shape, likely_keypoints, padding=0)
+                        score_likely_bboxes = np.nanmean(likely_scores, axis=1)
+
+                        valid_indices = np.where(~np.isnan(score_likely_bboxes))[0]
+                        if len(valid_indices) > 0:
+                            valid_bboxes = likely_bboxes[valid_indices]
+                            valid_scores_nms = score_likely_bboxes[valid_indices]
+                            keep_valid = nms(valid_bboxes, valid_scores_nms, nms_thr=0.45)
+                            keep = valid_indices[keep_valid]
+                        else:
+                            keep = []
+                        keypoints, scores = likely_keypoints[keep], likely_scores[keep]
+
+                    # Tracking
+                    if tracking_mode == 'deepsort':
+                        keypoints, scores = sort_people_deepsort(keypoints, scores, deepsort_tracker, frame, fidx)
+                    if tracking_mode == 'sports2d':
+                        if 'prev_keypoints' not in locals():
+                            prev_keypoints = keypoints
+                        prev_keypoints, keypoints, scores = sort_people_sports2d(prev_keypoints, keypoints, scores=scores, max_dist=max_distance_px)
+
+                    # Person filter
+                    keypoints, scores, prev_anchor, stats = filter_person_detections(
+                        keypoints, scores, frame_shape, video_path, person_filter_cfg, prev_anchor=prev_anchor)
+                    if stats is not None:
+                        filter_stats['frames'] += 1
+                        filter_stats['detections_before'] += stats['total']
+                        filter_stats['detections_after'] += stats['kept']
+                        filter_stats['frames_multi_before'] += int(stats['total'] > 1)
+                        filter_stats['frames_multi_after'] += int(stats['kept'] > 1)
+                        filter_stats['frames_empty_after'] += int(stats['kept'] == 0)
+                except:
+                    keypoints = np.full((1, kpt_id_max, 2), fill_value=np.nan)
+                    scores = np.full((1, kpt_id_max), fill_value=np.nan)
+
+                # Save to json
+                if 'openpose' in output_format:
+                    json_file_path = os.path.join(json_output_dir, f'{video_name_wo_ext}_{fidx:06d}.json')
+                    save_to_openpose(json_file_path, keypoints, scores)
+
+                # Draw skeleton
+                if display_detection or save_video or save_images:
+                    valid_X, valid_Y, valid_scores = [], [], []
+                    for person_keypoints, person_scores in zip(keypoints, scores):
+                        person_X, person_Y = person_keypoints[:, 0], person_keypoints[:, 1]
+                        valid_X.append(person_X)
+                        valid_Y.append(person_Y)
+                        valid_scores.append(person_scores)
+                    img_show = frame.copy()
+                    img_show = draw_bounding_box(img_show, valid_X, valid_Y, colors=colors, fontSize=2, thickness=thickness)
+                    img_show = draw_keypts(img_show, valid_X, valid_Y, valid_scores, cmap_str='RdYlGn')
+                    img_show = draw_skel(img_show, valid_X, valid_Y, pose_model_tree)
+
+                if display_detection:
+                    cv2.imshow(f"Pose Estimation {os.path.basename(video_path)}", img_show)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        quit_flag = True
+                        break
+
+                if save_video:
+                    out.write(img_show)
+
+                if save_images:
+                    if not os.path.isdir(img_output_dir): os.makedirs(img_output_dir)
+                    cv2.imwrite(os.path.join(img_output_dir, f'{video_name_wo_ext}_{fidx:06d}.jpg'), img_show)
+
+                pbar.update(1)
+
+    cap.release()
+    if save_video:
+        out.release()
+        logging.info(f"--> Output video saved to {output_video_path}.")
+    if save_images:
+        logging.info(f"--> Output images saved to {img_output_dir}.")
+    if display_detection:
+        cv2.destroyAllWindows()
+    if person_filter_cfg.get('enabled', False) and filter_stats['frames'] > 0:
+        logging.info(
+            f'Person filter summary for {os.path.basename(video_path)}: '
+            f'mean detections/frame {filter_stats["detections_before"]/filter_stats["frames"]:.2f} -> '
+            f'{filter_stats["detections_after"]/filter_stats["frames"]:.2f}, '
+            f'frames with >1 detection {filter_stats["frames_multi_before"]} -> {filter_stats["frames_multi_after"]}, '
+            f'empty frames after filter {filter_stats["frames_empty_after"]}.'
+        )
+
+
+def process_images(image_folder_path, vid_img_extension, pose_tracker, pose_model, output_format, fps, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker, person_filter_cfg):
     '''
     Estimate pose estimation from a folder of images
-    
+
     INPUTS:
     - image_folder_path: str. Path to the input image folder
     - vid_img_extension: str. Extension of the image files
@@ -482,6 +969,8 @@ def process_images(image_folder_path, vid_img_extension, pose_tracker, pose_mode
     # Retrieve keypoint names from model
     keypoints_ids = [node.id for _, _, node in RenderTree(pose_model) if node.id!=None]
     kpt_id_max = max(keypoints_ids)+1
+    prev_anchor = None
+    filter_stats = {'frames': 0, 'detections_before': 0, 'detections_after': 0, 'frames_multi_before': 0, 'frames_multi_after': 0, 'frames_empty_after': 0}
     
     f_range = [[0,len(image_files)] if frame_range in ('all', 'auto', []) else frame_range][0]
     for frame_idx, image_file in enumerate(tqdm(image_files, desc=f'\nProcessing {os.path.basename(img_output_dir)}')):
@@ -503,6 +992,22 @@ def process_images(image_folder_path, vid_img_extension, pose_tracker, pose_mode
                     if 'prev_keypoints' not in locals(): 
                         prev_keypoints = keypoints
                     prev_keypoints, keypoints, scores = sort_people_sports2d(prev_keypoints, keypoints, scores=scores, max_dist=max_distance_px)
+
+                keypoints, scores, prev_anchor, stats = filter_person_detections(
+                    keypoints,
+                    scores,
+                    frame.shape,
+                    image_folder_path,
+                    person_filter_cfg,
+                    prev_anchor=prev_anchor,
+                )
+                if stats is not None:
+                    filter_stats['frames'] += 1
+                    filter_stats['detections_before'] += stats['total']
+                    filter_stats['detections_after'] += stats['kept']
+                    filter_stats['frames_multi_before'] += int(stats['total'] > 1)
+                    filter_stats['frames_multi_after'] += int(stats['kept'] > 1)
+                    filter_stats['frames_empty_after'] += int(stats['kept'] == 0)
             except:
                 keypoints = np.full((1,kpt_id_max,2), fill_value=np.nan)
                 scores = np.full((1,kpt_id_max), fill_value=np.nan)
@@ -549,6 +1054,14 @@ def process_images(image_folder_path, vid_img_extension, pose_tracker, pose_mode
         logging.info(f"--> Output images saved to {img_output_dir}.")
     if display_detection:
         cv2.destroyAllWindows()
+    if person_filter_cfg.get('enabled', False) and filter_stats['frames'] > 0:
+        logging.info(
+            f'Person filter summary for {os.path.basename(image_folder_path)}: '
+            f'mean detections/frame {filter_stats["detections_before"]/filter_stats["frames"]:.2f} -> '
+            f'{filter_stats["detections_after"]/filter_stats["frames"]:.2f}, '
+            f'frames with >1 detection {filter_stats["frames_multi_before"]} -> {filter_stats["frames_multi_after"]}, '
+            f'empty frames after filter {filter_stats["frames_empty_after"]}.'
+        )
 
 
 def estimate_pose_all(config_dict):
@@ -614,6 +1127,7 @@ def estimate_pose_all(config_dict):
 
     backend = config_dict['pose']['backend']
     device = config_dict['pose']['device']
+    batch_size = config_dict.get('pose', {}).get('batch_size', 1)
 
     # Determine frame rate
     video_files = glob.glob(os.path.join(video_dir, '*'+vid_img_extension))
@@ -641,6 +1155,7 @@ def estimate_pose_all(config_dict):
     logging.info('\nEstimating pose...')
     pose_model_name = pose_model
     pose_model, ModelClass, mode = setup_model_class_mode(pose_model, mode, config_dict)
+    person_filter_cfg = build_person_filter_config(config_dict, pose_model)
 
     # Select device and backend
     backend, device = setup_backend_device(backend=backend, device=device)
@@ -670,15 +1185,30 @@ def estimate_pose_all(config_dict):
         logging.info(f'Mode: {mode}.')
         logging.info(f'Tracking is performed with {tracking_mode}{"" if not tracking_mode=="deepsort" else f" with parameters: {deepsort_params}"}.\n')
 
+        # Check if batch mode is available
+        use_batch = (batch_size > 1 and backend == 'onnxruntime'
+                     and pose_tracker.det_model is not None)  # top-down only for now
+        if use_batch:
+            logging.info(f'GPU batch inference enabled: batch_size={batch_size}.')
+        elif batch_size > 1:
+            logging.warning(f'batch_size={batch_size} requested but batch inference requires onnxruntime backend '
+                          f'with top-down model. Falling back to single-frame processing.')
+
         video_files = sorted(glob.glob(os.path.join(video_dir, '*'+vid_img_extension)))
-        if not len(video_files) == 0: 
+        if not len(video_files) == 0:
             # Process video files
             logging.info(f'Found video files with {vid_img_extension} extension.')
             for video_path in video_files:
                 pose_tracker.reset()
-                if tracking_mode == 'deepsort': 
+                if tracking_mode == 'deepsort':
                     deepsort_tracker.tracker.delete_all_tracks()
-                process_video(video_path, pose_tracker, pose_model, output_format, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker)
+                if use_batch:
+                    process_video_batched(video_path, pose_tracker.det_model, pose_tracker.pose_model, pose_model,
+                                         batch_size, det_frequency, output_format, save_video, save_images,
+                                         display_detection, frame_range, tracking_mode, max_distance_px,
+                                         deepsort_tracker, person_filter_cfg)
+                else:
+                    process_video(video_path, pose_tracker, pose_model, output_format, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker, person_filter_cfg)
 
         else:
             # Process image folders
@@ -695,4 +1225,4 @@ def estimate_pose_all(config_dict):
                     image_folder_path = os.path.join(video_dir, image_folder)
                     if tracking_mode == 'deepsort': 
                         deepsort_tracker.tracker.delete_all_tracks()                
-                    process_images(image_folder_path, vid_img_extension, pose_tracker, pose_model, output_format, frame_rate, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker)
+                    process_images(image_folder_path, vid_img_extension, pose_tracker, pose_model, output_format, frame_rate, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker, person_filter_cfg)

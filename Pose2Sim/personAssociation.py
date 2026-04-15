@@ -274,6 +274,25 @@ def read_json(js_file):
     return json_data
 
 
+def single_person_direct_proposal(json_files_framef):
+    '''
+    If each camera has at most one detected person, return the direct proposal.
+    Otherwise return None and fall back to the full combinations search.
+    '''
+
+    proposal = []
+    for js_file in json_files_framef:
+        people = read_json(js_file)
+        if len(people) == 0:
+            proposal.append(np.nan)
+        elif len(people) == 1:
+            proposal.append(0.0)
+        else:
+            return None
+
+    return np.array([proposal], dtype=float)
+
+
 def compute_rays(json_coord, calib_params, cam_id):
     '''
     Plucker coordinates of rays from camera to each joint of a person
@@ -733,6 +752,7 @@ def associate_all(config_dict):
     except: pass
     
     error_min_tot, cameras_off_tot = [], []
+    direct_single_person_frames = 0
     f_range = [[0,max([len(j) for j in json_files_names])] if frame_range in ('all', 'auto', []) else frame_range][0]
     n_cams = len(json_dirs_names)
 
@@ -767,8 +787,12 @@ def associate_all(config_dict):
         json_tracked_files_f = [os.path.join(poseTracked_dir, json_dirs_names[c], json_files_names_f[c]) for c in range(n_cams)]
 
         if not multi_person:
-            # all possible combinations of persons
-            personsIDs_comb = persons_combinations(json_files_f) 
+            # all possible combinations of persons unless every camera already has at most one detection
+            personsIDs_comb = single_person_direct_proposal(json_files_f)
+            if personsIDs_comb is None:
+                personsIDs_comb = persons_combinations(json_files_f)
+            else:
+                direct_single_person_frames += 1
             
             # choose persons of interest and exclude cameras with bad pose estimation
             error_proposals, proposals, Q_kpt = best_persons_and_cameras_combination(config_dict, json_files_f, personsIDs_comb, P_all, tracked_keypoint_id, calib_params)
@@ -805,5 +829,7 @@ def associate_all(config_dict):
 
 
     # recap message
+    if not multi_person and direct_single_person_frames > 0:
+        logging.info(f'Used the direct single-person association path on {direct_single_person_frames} frames.')
     recap_tracking(config_dict, error_min_tot, cameras_off_tot)
     

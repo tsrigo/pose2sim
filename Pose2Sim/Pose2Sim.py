@@ -232,6 +232,11 @@ class Pose2SimPipeline:
     def personAssociation(self):
         from Pose2Sim.personAssociation import associate_all
         for config_dict in self.config_dicts:
+            multi_person = config_dict.get('project', {}).get('multi_person', False)
+            if not multi_person:
+                logging.info('Single-person mode: skipping person association. '
+                            'Triangulation will read from pose/ or pose-sync/ directly.')
+                continue
             self._log_step_header("Associating persons", config_dict)
             start = time.time()
             associate_all(config_dict)

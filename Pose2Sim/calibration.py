@@ -1009,12 +1009,21 @@ def findCorners(img_path, corner_nb, objp=[], show=True):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # Find corners
+    # Find corners. Fall back to the SB detector when the classic detector fails
+    # on wide-angle or high-perspective checkerboard views.
     ret, corners = cv2.findChessboardCorners(gray, corner_nb, None)
+    detector_name = 'classic'
+    if not ret and hasattr(cv2, 'findChessboardCornersSB'):
+        ret, corners = cv2.findChessboardCornersSB(gray, corner_nb, None)
+        detector_name = 'SB' if ret else detector_name
+
     # If corners are found, refine corners
-    if ret == True: 
-        imgp = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
-        logging.info(f'{os.path.basename(img_path)}: Corners found.')
+    if ret == True:
+        if detector_name == 'classic':
+            imgp = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
+        else:
+            imgp = corners
+        logging.info(f'{os.path.basename(img_path)}: Corners found with {detector_name} detector.')
         
         if show:
             # Draw corners

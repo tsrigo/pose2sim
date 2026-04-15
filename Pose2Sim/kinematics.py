@@ -36,6 +36,7 @@
 import os
 import sys
 from pathlib import Path
+from functools import lru_cache
 import numpy as np
 np.set_printoptions(legacy='1.21') # otherwise prints np.float64(3.0) rather than 3.0
 from lxml import etree
@@ -64,6 +65,7 @@ __status__ = "Development"
 
 
 ## FUNCTIONS
+@lru_cache(maxsize=1)
 def get_opensim_setup_dir():
     '''
     Locate the OpenSim setup directory within the Pose2Sim package.
@@ -80,6 +82,7 @@ def get_opensim_setup_dir():
     return setup_dir
 
 
+@lru_cache(maxsize=None)
 def get_model_path(use_simple_model, osim_setup_dir):
     '''
     Retrieve the path of the OpenSim model file.
@@ -102,6 +105,7 @@ def get_model_path(use_simple_model, osim_setup_dir):
     return unscaled_model_path
 
 
+@lru_cache(maxsize=None)
 def get_markers_path(pose_model, osim_setup_dir):
     '''
     Retrieve the path of the marker file.
@@ -133,6 +137,7 @@ def get_markers_path(pose_model, osim_setup_dir):
     return markers_path
 
 
+@lru_cache(maxsize=None)
 def get_scaling_setup(pose_model, osim_setup_dir):
     '''
     Retrieve the path of the OpenSim scaling setup file.
@@ -164,6 +169,7 @@ def get_scaling_setup(pose_model, osim_setup_dir):
     return scaling_setup_path
 
 
+@lru_cache(maxsize=None)
 def get_IK_Setup(pose_model, osim_setup_dir):
     '''
     Retrieve the path of the OpenSim inverse kinematics setup file.
@@ -195,6 +201,69 @@ def get_IK_Setup(pose_model, osim_setup_dir):
         raise ValueError(f"Pose model '{pose_model}' not supported yet.")
 
     return ik_setup_path
+
+
+def get_default_ik_marker_weights():
+    '''
+    Default gait-friendly IK marker weights for direct 22-marker inputs.
+    '''
+
+    return {
+        'Head': 0.05,
+        'Nose': 0.05,
+        'Neck': 0.2,
+        'Hip': 1.0,
+        'LHip': 2.0,
+        'RHip': 2.0,
+        'LKnee': 1.5,
+        'RKnee': 1.5,
+        'LShoulder': 2.0,
+        'RShoulder': 2.0,
+        'LElbow': 1.0,
+        'RElbow': 1.0,
+        'LWrist': 0.7,
+        'RWrist': 0.7,
+        'LAnkle': 1.2,
+        'RAnkle': 1.2,
+        'LBigToe': 0.5,
+        'RBigToe': 0.5,
+        'LSmallToe': 0.3,
+        'RSmallToe': 0.3,
+        'LHeel': 0.5,
+        'RHeel': 0.5,
+    }
+
+
+def get_ik_marker_weight_overrides(config_dict):
+    '''
+    Merge default and user-provided IK marker weights.
+    '''
+
+    ik_weight_cfg = config_dict.get('kinematics', {}).get('ik_weights', {})
+    if isinstance(ik_weight_cfg, dict) and ik_weight_cfg.get('enabled', True) is False:
+        return {}
+
+    weights = get_default_ik_marker_weights()
+    if isinstance(ik_weight_cfg, dict):
+        weights.update(ik_weight_cfg.get('weights', {}))
+    return weights
+
+
+def apply_ik_marker_weights(ik_root, marker_weights):
+    '''
+    Update IK marker task weights in an XML tree.
+    '''
+
+    if not marker_weights:
+        return
+
+    for marker_task in ik_root.findall('.//IKMarkerTask'):
+        marker_name = marker_task.get('name')
+        if marker_name not in marker_weights:
+            continue
+        weight_elem = marker_task.find('weight')
+        if weight_elem is not None:
+            weight_elem.text = str(marker_weights[marker_name])
 
 
 def get_kpt_pairs_from_tree(root_node):
@@ -235,6 +304,16 @@ def get_kpt_pairs_from_scaling(scaling_root):
              for pair in scaling_root[0].findall(".//MarkerPair")]
 
     return pairs
+
+
+@lru_cache(maxsize=None)
+def load_trc_cached(trc_file):
+    '''
+    Cache parsed TRC content so scaling, IK, and auto-height do not reread the
+    same file within one run.
+    '''
+
+    return read_trc(trc_file)
 
 
 def dict_segment_marker_pairs(scaling_root, right_left_symmetry=True):
@@ -382,7 +461,8 @@ def update_scale_values(scaling_root, segment_ratio_dict):
 
 def perform_scaling(trc_file, pose_model, kinematics_dir, osim_setup_dir, 
                     use_simple_model=False, right_left_symmetry=True, subject_height=1.75, subject_mass=70, 
-                    remove_scaling_setup=True, fastest_frames_to_remove_percent=0.1,close_to_zero_speed_m=0.2, large_hip_knee_angles=45, trimmed_extrema_percent=0.5):
+                    remove_scaling_setup=True, fastest_frames_to_remove_percent=0.1,close_to_zero_speed_m=0.2, large_hip_knee_angles=45, trimmed_extrema_percent=0.5,
+                    trc_data=None):
     '''
     Perform model scaling based on the (not necessarily static) TRC file:
     - Remove 10% fastest frames (potential outliers)
@@ -431,7 +511,9 @@ def perform_scaling(trc_file, pose_model, kinematics_dir, osim_setup_dir,
         scaling_path_temp = str(kinematics_dir / (trc_file.stem + '_scaling_setup.xml'))
         
         # Remove fastest frames, frames with null speed, and frames with large hip and knee angles
-        Q_coords, _, _, markers, _ = read_trc(trc_file)
+        if trc_data is None:
+            trc_data = load_trc_cached(str(trc_file))
+        Q_coords, _, _, markers, _ = trc_data
         Q_coords_low_speeds_low_angles = best_coords_for_measurements(Q_coords, markers, fastest_frames_to_remove_percent=fastest_frames_to_remove_percent, large_hip_knee_angles=large_hip_knee_angles, close_to_zero_speed=close_to_zero_speed_m)
 
         if Q_coords_low_speeds_low_angles.size == 0:
@@ -468,7 +550,7 @@ def perform_scaling(trc_file, pose_model, kinematics_dir, osim_setup_dir,
         raise
 
 
-def perform_IK(trc_file, kinematics_dir, osim_setup_dir, pose_model, remove_IK_setup=True):
+def perform_IK(trc_file, kinematics_dir, osim_setup_dir, pose_model, remove_IK_setup=True, trc_data=None, marker_weights=None):
     '''
     Perform inverse kinematics based on a TRC file and a scaled OpenSim model:
     - Model markers follow the triangulated markers while respecting the model kinematic constraints
@@ -493,7 +575,9 @@ def perform_IK(trc_file, kinematics_dir, osim_setup_dir, pose_model, remove_IK_s
         output_motion_file = Path(kinematics_dir, trc_file.stem + '.mot').resolve()
         if not trc_file.exists():
             raise FileNotFoundError(f"TRC file does not exist: {trc_file}")
-        _, _, time_col, _, _ = read_trc(trc_file)
+        if trc_data is None:
+            trc_data = load_trc_cached(str(trc_file))
+        _, _, time_col, _, _ = trc_data
         start_time, end_time = time_col.iloc[0], time_col.iloc[-1]
 
         # Update IK setup file
@@ -503,6 +587,7 @@ def perform_IK(trc_file, kinematics_dir, osim_setup_dir, pose_model, remove_IK_s
         ik_root.find('.//time_range').text = f'{start_time} {end_time}'
         ik_root.find('.//output_motion_file').text = str(output_motion_file)
         ik_root.find('.//marker_file').text = str(trc_file.resolve())
+        apply_ik_marker_weights(ik_root, marker_weights or {})
         ik_tree.write(ik_path_temp)
 
         # Run IK
@@ -564,6 +649,7 @@ def kinematics_all(config_dict):
 
     remove_scaling_setup = config_dict.get('kinematics').get('remove_individual_scaling_setup')
     remove_IK_setup = config_dict.get('kinematics').get('remove_individual_ik_setup')
+    ik_marker_weights = get_ik_marker_weight_overrides(config_dict)
 
     pose3d_dir = Path(project_dir) / 'pose-3d'
     kinematics_dir = Path(project_dir) / 'kinematics'
@@ -583,7 +669,8 @@ def kinematics_all(config_dict):
         if len(trc_files) == 0:
             pose_model = config_dict.get('pose').get('pose_model').upper()
             use_augmentation = False
-            logging.warning("No LSTM trc files found. Using non augmented trc files instead.")
+            logging.warning("Marker augmentation was requested, but no '_LSTM.trc' files were found in pose-3d.")
+            logging.warning("Using non-augmented TRC files instead. Run Pose2Sim.markerAugmentation() first if you want augmented OpenSim inputs.")
     if len(trc_files) == 0: # filtered files by default
         trc_files = [f for f in pose3d_dir.glob('*.trc') if '_LSTM' not in f.name and '_filt' in f.name and '_scaling' not in f.name]
     if len(trc_files) == 0: 
@@ -614,7 +701,7 @@ def kinematics_all(config_dict):
         subject_height = []
         for trc_file in trc_files:
             try:
-                trc_data, _, _, markers, _ = read_trc(trc_file)
+                trc_data, _, _, markers, _ = load_trc_cached(str(trc_file))
                 height = compute_height(
                     trc_data,
                     markers,
@@ -653,17 +740,27 @@ def kinematics_all(config_dict):
     # Perform scaling and IK for each trc file
     for p, trc_file in enumerate(trc_files):
         logging.info(f"Processing TRC file: {trc_file.resolve()}")
+        trc_data = load_trc_cached(str(trc_file))
 
         logging.info("\nScaling...")
         perform_scaling(trc_file, pose_model, kinematics_dir, osim_setup_dir, use_simple_model, right_left_symmetry=right_left_symmetry, subject_height=subject_height[p], subject_mass=subject_mass[p], 
-                        remove_scaling_setup=remove_scaling_setup, fastest_frames_to_remove_percent=fastest_frames_to_remove_percent, large_hip_knee_angles=large_hip_knee_angles, trimmed_extrema_percent=trimmed_extrema_percent,close_to_zero_speed_m=close_to_zero_speed)
+                        remove_scaling_setup=remove_scaling_setup, fastest_frames_to_remove_percent=fastest_frames_to_remove_percent, large_hip_knee_angles=large_hip_knee_angles, trimmed_extrema_percent=trimmed_extrema_percent,close_to_zero_speed_m=close_to_zero_speed,
+                        trc_data=trc_data)
         logging.info(f"\tDone. OpenSim logs saved to {opensim_logs_file.resolve()}.")
         logging.info(f"\tScaled model saved to {(kinematics_dir / (trc_file.stem + '_scaled.osim')).resolve()}")
         
         logging.info("\nInverse Kinematics...")
         import time
         start_time = time.time()
-        perform_IK(trc_file, kinematics_dir, osim_setup_dir, pose_model, remove_IK_setup=remove_IK_setup)
+        perform_IK(
+            trc_file,
+            kinematics_dir,
+            osim_setup_dir,
+            pose_model,
+            remove_IK_setup=remove_IK_setup,
+            trc_data=trc_data,
+            marker_weights=ik_marker_weights
+        )
         end_time = time.time()
         print(f"\tIK took {round(end_time - start_time, 2)} seconds for {trc_file.name}.")
         logging.info(f"\tDone. OpenSim logs saved to {opensim_logs_file.resolve()}.")
