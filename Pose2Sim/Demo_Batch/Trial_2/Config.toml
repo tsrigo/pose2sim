@@ -75,6 +75,7 @@ participant_mass = [70.0, 63.5]     # float (eg 70.0), or list of floats (eg [70
 
 # det_frequency = 4 # Run person detection only every N frames, and inbetween track previously detected bounding boxes (pose estimation is still run on all frames). 
 #                   # Equal to or greater than 1, can be as high as you want in simple uncrowded cases. Much faster, but might be less accurate. 
+# batch_size = 8 # GPU batch size for frame / crop inference. Uncomment to override the parent Config.toml value.
 # device = 'auto' # 'auto', 'CPU', 'CUDA', 'MPS', 'ROCM'
 # backend = 'auto' # 'auto', 'openvino', 'onnxruntime', 'opencv'
 # parallel_workers_pose = 'auto' # 'auto', int, or false # One worker per video, using GPU if available
@@ -209,6 +210,7 @@ keypoints_to_consider = ['RWrist'] # 'all' if all points should be considered, f
 # # output
 # show_interp_indices = true # true or false (lowercase). For each keypoint, return the frames that need to be interpolated
 # make_c3d = true # save triangulated data in c3d format in addition to trc
+# parallel_triangulation = 'auto' # 'auto', int, or false. Uncomment to override the parent Config.toml value.
 
 
 # [filtering]
