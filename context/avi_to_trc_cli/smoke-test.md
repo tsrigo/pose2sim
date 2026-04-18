@@ -1,27 +1,27 @@
-# Local Smoke Test Evidence
+# 本地 Smoke Test 证据
 
-## Goal
+## 目标
 
-Verify the new `avi_to_trc` path end to end:
+验证新的 `avi_to_trc` 路径可以端到端跑通：
 
-1. read a Pose2Sim-style trial with `videos/*.avi`
-2. export OpenPose JSONs with batched RTMPose crop inference
-3. triangulate into a standard `.trc`
+1. 读取 Pose2Sim 风格 trial 中的 `videos/*.avi`
+2. 以批量 RTMPose crop 推理导出 OpenPose JSON
+3. 三角化生成标准 `.trc`
 
-## Local Test Setup
+## 本地测试设置
 
-Temporary session used for the smoke run:
+此次 smoke run 使用的临时 session：
 
-- Session root: `/tmp/avi-to-trc-test-ATAssR/Session`
-- Trial root: `/tmp/avi-to-trc-test-ATAssR/Session/Trial_1`
+- Session 根目录：`/tmp/avi-to-trc-test-ATAssR/Session`
+- Trial 根目录：`/tmp/avi-to-trc-test-ATAssR/Session/Trial_1`
 
-Source assets:
+源数据：
 
-- videos copied from `Pose2Sim/Demo_SinglePerson/videos/*.mp4`
-- renamed to `*.avi`
-- calibration converted from `Calib.qca.txt` to `Calib_qualisys.toml`
+- 视频来自 `Pose2Sim/Demo_SinglePerson/videos/*.mp4`
+- 文件名被改成了 `*.avi`
+- 标定从 `Calib.qca.txt` 转成了 `Calib_qualisys.toml`
 
-Config overrides used for the smoke run:
+本次 smoke run 使用的配置覆盖：
 
 - `frame_range = [0, 8]`
 - `mode = 'lightweight'`
@@ -32,11 +32,9 @@ Config overrides used for the smoke run:
 - `make_c3d = false`
 - `min_chunk_size = 1`
 
-The `min_chunk_size` override was only needed because the smoke test uses 8
-frames. The default config expects at least 10 valid consecutive frames and
-would reject such a short trial.
+这里额外把 `min_chunk_size` 设为 `1`，只是因为这次 smoke test 只有 `8` 帧。默认配置要求至少 `10` 个连续有效帧，否则会把这么短的 trial 过滤掉。
 
-## Command
+## 运行命令
 
 ```bash
 python Pose2Sim/Utilities/avi_to_trc.py \
@@ -45,9 +43,9 @@ python Pose2Sim/Utilities/avi_to_trc.py \
   --overwrite-pose
 ```
 
-## Observed Outputs
+## 观测到的输出
 
-Generated pose JSON directories:
+生成的 pose JSON 目录：
 
 ```text
 /tmp/avi-to-trc-test-ATAssR/Session/Trial_1/pose/cam01_json
@@ -56,7 +54,7 @@ Generated pose JSON directories:
 /tmp/avi-to-trc-test-ATAssR/Session/Trial_1/pose/cam04_json
 ```
 
-Generated JSON counts:
+生成的 JSON 数量：
 
 ```text
 cam01_json 8
@@ -65,11 +63,11 @@ cam03_json 8
 cam04_json 8
 ```
 
-Generated TRC:
+生成的 TRC：
 
 - `/tmp/avi-to-trc-test-ATAssR/Session/Trial_1/pose-3d/Trial_1_0-7.trc`
 
-TRC header excerpt:
+TRC 头部摘录：
 
 ```text
 PathFileType	4	(X/Y/Z)	Trial_1_0-7.trc
@@ -78,7 +76,7 @@ DataRate	CameraRate	NumFrames	NumMarkers	Units	OrigDataRate	OrigDataStartFrame	O
 Frame#	Time	Hip			RHip			RKnee			RAnkle			RBigToe			RSmallToe			RHeel			LHip			LKnee			LAnkle			LBigToe			LSmallToe			LHeel			Neck			Head			Nose			RShoulder			RElbow			RWrist			LShoulder			LElbow			LWrist
 ```
 
-TRC structural check:
+TRC 结构检查：
 
 ```text
 frames 8
@@ -88,9 +86,9 @@ time_range 0.0 0.1166666666666666
 first_markers ['Hip', 'RHip', 'RKnee', 'RAnkle', 'RBigToe']
 ```
 
-## Selected Runtime Observations
+## 运行时现象摘录
 
-Per-camera summary reported by the CLI:
+CLI 输出的每路相机摘要：
 
 ```text
 cam01.avi: processed 8 frames, dropped 0, detection misses 0, pose batches 2.
@@ -99,18 +97,18 @@ cam03.avi: processed 8 frames, dropped 0, detection misses 0, pose batches 2.
 cam04.avi: processed 8 frames, dropped 0, detection misses 0, pose batches 2.
 ```
 
-Triangulation summary reported by the existing pipeline:
+现有三角化流程输出的摘要：
 
 ```text
 --> Mean reprojection error for all points on frames 0 to 8 is 11.0 px, which roughly corresponds to 20.0 mm.
 3D coordinates are stored at /tmp/avi-to-trc-test-ATAssR/Session/Trial_1/pose-3d/Trial_1_0-7.trc.
 ```
 
-## Conclusion
+## 结论
 
-The new path completed end to end on a real local run:
+这条新路径已经在真实本地运行中端到端跑通：
 
-- `*.avi` input accepted
-- batched pose JSON export completed for all 4 cameras
-- triangulation consumed the exported JSONs without format changes
-- a standard 3D `.trc` was produced
+- `*.avi` 输入被正确接受
+- 4 路相机的批量 pose JSON 导出成功
+- 三角化无须改格式即可直接消费这些 JSON
+- 最终生成了标准 3D `.trc`
