@@ -1,0 +1,85 @@
+{
+  "study_root_tmp": "/tmp/personassoc-study-aySApY",
+  "frame_range": [
+    0,
+    12
+  ],
+  "base_pose_people_stats": {
+    "cam01_json": {
+      "max_people": 2,
+      "frames_with_gt1": 12,
+      "total_frames": 12,
+      "mean_people": 2.0
+    },
+    "cam02_json": {
+      "max_people": 1,
+      "frames_with_gt1": 0,
+      "total_frames": 12,
+      "mean_people": 1.0
+    },
+    "cam03_json": {
+      "max_people": 1,
+      "frames_with_gt1": 0,
+      "total_frames": 12,
+      "mean_people": 1.0
+    },
+    "cam04_json": {
+      "max_people": 1,
+      "frames_with_gt1": 0,
+      "total_frames": 12,
+      "mean_people": 1.0
+    }
+  },
+  "associated_pose_people_stats": {
+    "cam01_json": {
+      "max_people": 1,
+      "frames_with_gt1": 0,
+      "total_frames": 12,
+      "mean_people": 1.0
+    },
+    "cam02_json": {
+      "max_people": 1,
+      "frames_with_gt1": 0,
+      "total_frames": 12,
+      "mean_people": 1.0
+    },
+    "cam03_json": {
+      "max_people": 1,
+      "frames_with_gt1": 0,
+      "total_frames": 12,
+      "mean_people": 1.0
+    },
+    "cam04_json": {
+      "max_people": 1,
+      "frames_with_gt1": 0,
+      "total_frames": 12,
+      "mean_people": 1.0
+    }
+  },
+  "comparisons": {
+    "clean_skip_vs_clean_with": {
+      "rms_m": 0.02391997962502132,
+      "mean_marker_dist_m": 0.028342406232517103,
+      "max_marker_dist_m": 0.1361858034241759,
+      "valid_ratio": 1.0
+    },
+    "oracle_single_direct_vs_clean_with": {
+      "rms_m": 0.0,
+      "mean_marker_dist_m": 0.0,
+      "max_marker_dist_m": 0.0,
+      "valid_ratio": 1.0
+    },
+    "distractor_skip_vs_clean_with": {
+      "rms_m": 0.2133830028313792,
+      "mean_marker_dist_m": 0.25918757040335944,
+      "max_marker_dist_m": 0.7894042408167107,
+      "valid_ratio": 1.0
+    },
+    "distractor_with_vs_clean_with": {
+      "rms_m": 0.0,
+      "mean_marker_dist_m": 0.0,
+      "max_marker_dist_m": 0.0,
+      "valid_ratio": 1.0
+    }
+  }
+}

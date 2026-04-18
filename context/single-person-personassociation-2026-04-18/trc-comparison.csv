@@ -1,0 +1,5 @@
+condition,rms_mm,mean_marker_dist_mm,max_marker_dist_mm,valid_ratio
+clean_skip_vs_clean_with,23.920,28.342,136.186,1.000
+oracle_single_direct_vs_clean_with,0.000,0.000,0.000,1.000
+distractor_skip_vs_clean_with,213.383,259.188,789.404,1.000
+distractor_with_vs_clean_with,0.000,0.000,0.000,1.000

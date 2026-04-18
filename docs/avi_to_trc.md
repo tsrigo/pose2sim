@@ -102,6 +102,8 @@ avi_to_trc \
 
 如果场景里可能有路人、误检或多人重叠，那么更稳妥的做法仍然是走标准 Pose2Sim 流程，并保留 `personAssociation`。
 
+如果要看这件事的本地实跑对照，见 [单人场景下是否需要 personAssociation](single-person-personassociation.md)。
+
 ## 性能模型
 
 当前的 batching 主要发生在 pose 推理阶段，不一定发生在 detection 阶段。

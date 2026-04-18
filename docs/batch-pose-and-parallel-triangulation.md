@@ -125,6 +125,8 @@ GPU 上的推荐起点：
 
 另外，`avi_to_trc` 这条新 CLI 在 v1 里就是单人路径，会直接从 `pose` JSON 走到最终 TRC，不包含 `personAssociation`。
 
+如果要看基于真实代码运行的专门对照实验，见 [单人场景下是否需要 personAssociation](single-person-personassociation.md)。
+
 ## 什么时候最容易看到提速
 
 更容易看到收益的条件是：
