@@ -1,0 +1,26 @@
+flowchart LR
+    A["单人 trial<br/>多机位视频"] --> B["poseEstimation<br/>生成 pose/*.json"]
+    B --> C{"每帧、每相机的 JSON 中<br/>是否都只有 1 个目标人？"}
+
+    C -- 是 --> D["可直接 triangulation"]
+    D --> E["生成最终 TRC"]
+
+    C -- 否 --> F["运行 personAssociation"]
+    F --> G["生成 pose-associated/*.json<br/>每帧只保留目标人"]
+    G --> H["再做 triangulation"]
+    H --> E
+
+    I["典型触发原因<br/>误检 / 路人 / 反光 / 多框"] -.-> F
+    J["代码行为<br/>triangulation 优先读取<br/>pose-associated → pose-sync → pose"] -.-> D
+
+    classDef input fill:#E8F5E9,stroke:#2E7D32,color:#1B4332,stroke-width:1.5px;
+    classDef process fill:#E3F2FD,stroke:#1565C0,color:#0B3D91,stroke-width:1.5px;
+    classDef decision fill:#FFF8E1,stroke:#F59E0B,color:#7C2D12,stroke-width:1.5px;
+    classDef warning fill:#FDECEC,stroke:#B91C1C,color:#7F1D1D,stroke-width:1.5px;
+    classDef note fill:#F8FAFC,stroke:#64748B,color:#334155,stroke-dasharray: 4 3;
+
+    class A input;
+    class B,D,F,G,H,E process;
+    class C decision;
+    class I warning;
+    class J note;

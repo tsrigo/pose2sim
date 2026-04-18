@@ -1,0 +1,13 @@
+## clean-with
+Single-person analysis selected.
+--> Mean reprojection error for Neck point on all frames is 11.5 px, which roughly corresponds to 20.9 mm. 
+Tracked json files are stored in /tmp/personassoc-study-aySApY/clean-with/Session/Trial_1/pose-associated.
+--> Mean reprojection error for all points on frames 0 to 12 is 11.0 px, which roughly corresponds to 20.0 mm. 
+3D coordinates are stored at /tmp/personassoc-study-aySApY/clean-with/Session/Trial_1/pose-3d/Trial_1_0-11.trc.
+
+## distractor-with
+Single-person analysis selected.
+--> Mean reprojection error for Neck point on all frames is 11.5 px, which roughly corresponds to 20.9 mm. 
+Tracked json files are stored in /tmp/personassoc-study-aySApY/distractor-with/Session/Trial_1/pose-associated.
+--> Mean reprojection error for all points on frames 0 to 12 is 11.0 px, which roughly corresponds to 20.0 mm. 
+3D coordinates are stored at /tmp/personassoc-study-aySApY/distractor-with/Session/Trial_1/pose-3d/Trial_1_0-11.trc.
