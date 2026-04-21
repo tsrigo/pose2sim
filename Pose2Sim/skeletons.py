@@ -70,7 +70,12 @@ HALPE_26 = Node("Hip", id=19, children=[
     ]),
     Node("Neck", id=18, children=[
         Node("Head", id=17, children=[
-            Node("Nose", id=0),
+            Node("Nose", id=0, children=[
+                Node("REye", id=2),
+                Node("LEye", id=1),
+                Node("REar", id=4),
+                Node("LEar", id=3),
+            ]),
         ]),
         Node("RShoulder", id=6, children=[
             Node("RElbow", id=8, children=[
