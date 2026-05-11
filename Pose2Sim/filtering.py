@@ -577,6 +577,246 @@ def median_filter_1d(config_dict, frame_rate, col):
     return col_filtered
 
 
+def _filter_rigid_group_config(config_dict):
+    return config_dict.get('filtering', {})
+
+
+def _parse_filter_rigid_marker_groups(config_dict, markers):
+    '''
+    Read optional 3D rigid marker groups from the filtering config.
+    '''
+
+    filter_config = _filter_rigid_group_config(config_dict)
+    raw_groups = filter_config.get('rigid_marker_groups', [])
+    if raw_groups in (None, False, []):
+        return []
+    if not isinstance(raw_groups, list):
+        logging.warning('filtering.rigid_marker_groups must be a list. Ignoring 3D rigid marker filtering.')
+        return []
+
+    min_markers = int(filter_config.get('rigid_group_min_markers', 3))
+    groups = []
+    seen_groups = set()
+    for group_id, raw_group in enumerate(raw_groups):
+        group_name = None
+        group_markers = raw_group
+        if isinstance(raw_group, dict):
+            group_name = raw_group.get('name')
+            group_markers = raw_group.get('markers', raw_group.get('names', raw_group.get('keypoints')))
+        if isinstance(group_markers, str):
+            group_markers = [marker.strip() for marker in group_markers.split(',') if marker.strip()]
+        if not group_markers:
+            logging.warning(f'3D rigid marker group {group_id} has no markers. Skipping it.')
+            continue
+
+        present_markers = []
+        missing_markers = []
+        for marker in group_markers:
+            if marker in markers and marker not in present_markers:
+                present_markers.append(marker)
+            else:
+                missing_markers.append(marker)
+
+        if missing_markers:
+            logging.warning(
+                f"3D rigid marker group {group_name or group_id} skipped missing markers: {missing_markers}."
+            )
+        if len(present_markers) < min_markers:
+            logging.warning(
+                f"3D rigid marker group {group_name or group_id} needs at least {min_markers} available markers. "
+                f"Only found {present_markers}. Skipping it."
+            )
+            continue
+
+        group_key = tuple(markers.index(marker) for marker in present_markers)
+        if group_key in seen_groups:
+            continue
+        seen_groups.add(group_key)
+        groups.append({
+            'name': group_name or '+'.join(present_markers),
+            'markers': present_markers,
+            'indices': list(group_key),
+        })
+
+    return groups
+
+
+def _marker_columns(marker_indices):
+    return np.array([marker_idx * 3 + axis for marker_idx in marker_indices for axis in range(3)], dtype=int)
+
+
+def _extract_marker_points(Q_coords, marker_indices):
+    columns = _marker_columns(marker_indices)
+    return Q_coords.iloc[:, columns].to_numpy(dtype=float).reshape(len(Q_coords), len(marker_indices), 3)
+
+
+def _build_3d_rigid_template(group_points, group_name, config_dict):
+    filter_config = _filter_rigid_group_config(config_dict)
+    min_template_frames = int(filter_config.get('rigid_group_template_min_frames', 20))
+    mad_factor = float(filter_config.get('rigid_group_template_mad_factor', 5.0))
+    distance_floor_m = float(filter_config.get('rigid_group_template_distance_floor_m', 0.02))
+
+    complete_frames = np.all(np.isfinite(group_points), axis=(1, 2))
+    if np.count_nonzero(complete_frames) < 3:
+        logging.warning(
+            f'3D rigid marker group {group_name} has fewer than 3 complete template frames. '
+            'Keeping point-wise filtered coordinates for this group.'
+        )
+        return None
+
+    candidate_points = group_points[complete_frames]
+    if len(candidate_points) < min_template_frames:
+        logging.warning(
+            f'3D rigid marker group {group_name} has only {len(candidate_points)} complete template frames '
+            f'(requested {min_template_frames}). Using the available frames.'
+        )
+
+    if candidate_points.shape[1] >= 2 and len(candidate_points) >= 5:
+        pairwise_distances = []
+        for marker_i in range(candidate_points.shape[1]):
+            for marker_j in range(marker_i + 1, candidate_points.shape[1]):
+                pairwise_distances.append(
+                    np.linalg.norm(candidate_points[:, marker_i] - candidate_points[:, marker_j], axis=1)
+                )
+        pairwise_distances = np.array(pairwise_distances).T
+        median_distances = np.nanmedian(pairwise_distances, axis=0)
+        mad_distances = np.nanmedian(np.abs(pairwise_distances - median_distances), axis=0)
+        thresholds = np.maximum(distance_floor_m, mad_factor * 1.4826 * mad_distances)
+        stable_frames = np.all(np.abs(pairwise_distances - median_distances) <= thresholds, axis=1)
+        if np.count_nonzero(stable_frames) >= 3:
+            candidate_points = candidate_points[stable_frames]
+
+    centered_points = candidate_points - np.mean(candidate_points, axis=1, keepdims=True)
+    template = np.nanmedian(centered_points, axis=0)
+    template = template - np.mean(template, axis=0, keepdims=True)
+    if not np.all(np.isfinite(template)):
+        logging.warning(f'3D rigid marker group {group_name} produced a non-finite template. Skipping it.')
+        return None
+    return template
+
+
+def _fit_3d_rigid_transform(template, target_points, min_markers):
+    valid_markers = np.all(np.isfinite(target_points), axis=1)
+    if np.count_nonzero(valid_markers) < min_markers:
+        return None
+
+    source = template[valid_markers]
+    target = target_points[valid_markers]
+    source_centroid = source.mean(axis=0)
+    target_centroid = target.mean(axis=0)
+    source_centered = source - source_centroid
+    target_centered = target - target_centroid
+
+    U, _, Vt = np.linalg.svd(source_centered.T @ target_centered)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    t = target_centroid - R @ source_centroid
+    rvec = cv2.Rodrigues(R)[0].ravel()
+    return np.concatenate([rvec, t])
+
+
+def _rigid_points_from_3d_params(params, template):
+    R = cv2.Rodrigues(params[:3])[0]
+    return (R @ template.T).T + params[3:6]
+
+
+def stabilize_rigid_marker_groups_3d(config_dict, Q_coords, markers):
+    '''
+    Stabilize configured 3D marker groups as approximate rigid bodies.
+
+    This offline post-filtering step handles cases where independently filtered
+    anatomical points still violate a local rigid structure, such as
+    Hip/RHip/LHip waist jitter in a TRC.
+    '''
+
+    rigid_groups = _parse_filter_rigid_marker_groups(config_dict, markers)
+    if not rigid_groups:
+        return Q_coords, []
+
+    filter_config = _filter_rigid_group_config(config_dict)
+    min_markers = int(filter_config.get('rigid_group_min_markers', 3))
+    smoothing_window = int(filter_config.get('rigid_group_smoothing_window', 31))
+    blend = float(filter_config.get('rigid_group_blend', 0.7))
+    fill_missing = bool(filter_config.get('rigid_group_fill_missing', False))
+    blend = float(np.clip(blend, 0.0, 1.0))
+
+    Q_stabilized = Q_coords.copy()
+    stats = []
+    for group in rigid_groups:
+        group_name = group['name']
+        marker_indices = group['indices']
+        columns = _marker_columns(marker_indices)
+        group_points = _extract_marker_points(Q_stabilized, marker_indices)
+        template = _build_3d_rigid_template(group_points, group_name, config_dict)
+        if template is None:
+            stats.append({'name': group_name, 'accepted': 0, 'total': len(Q_coords), 'mean_delta_mm': np.nan})
+            continue
+
+        params = np.full((len(group_points), 6), np.nan)
+        for frame_id, frame_points in enumerate(group_points):
+            frame_params = _fit_3d_rigid_transform(template, frame_points, min_markers)
+            if frame_params is not None:
+                params[frame_id] = frame_params
+
+        if np.count_nonzero(np.all(np.isfinite(params), axis=1)) == 0:
+            stats.append({'name': group_name, 'accepted': 0, 'total': len(Q_coords), 'mean_delta_mm': np.nan})
+            continue
+
+        if smoothing_window > 1:
+            params = pd.DataFrame(params).rolling(
+                window=smoothing_window,
+                center=True,
+                min_periods=1,
+            ).median().to_numpy()
+
+        accepted_frames = 0
+        deltas_mm = []
+        for frame_id, frame_params in enumerate(params):
+            if not np.all(np.isfinite(frame_params)):
+                continue
+            rigid_points = _rigid_points_from_3d_params(frame_params, template)
+            original_points = group_points[frame_id]
+            valid_markers = np.all(np.isfinite(original_points), axis=1)
+            if fill_missing:
+                valid_markers = valid_markers | np.all(np.isfinite(rigid_points), axis=1)
+            if not np.any(valid_markers):
+                continue
+
+            corrected_points = original_points.copy()
+            finite_markers = valid_markers & np.all(np.isfinite(original_points), axis=1)
+            corrected_points[finite_markers] = (
+                (1.0 - blend) * original_points[finite_markers]
+                + blend * rigid_points[finite_markers]
+            )
+            if fill_missing:
+                missing_markers = ~np.all(np.isfinite(original_points), axis=1) & np.all(np.isfinite(rigid_points), axis=1)
+                corrected_points[missing_markers] = rigid_points[missing_markers]
+
+            if np.any(finite_markers):
+                deltas_mm.extend(
+                    np.linalg.norm(corrected_points[finite_markers] - original_points[finite_markers], axis=1)
+                    * 1000.0
+                )
+            Q_stabilized.iloc[frame_id, columns] = corrected_points.reshape(-1)
+            accepted_frames += 1
+
+        mean_delta_mm = float(np.mean(deltas_mm)) if deltas_mm else np.nan
+        stats.append({
+            'name': group_name,
+            'accepted': accepted_frames,
+            'total': len(Q_coords),
+            'mean_delta_mm': mean_delta_mm,
+        })
+        logging.info(
+            f"3D rigid marker group {group_name}: stabilized {accepted_frames}/{len(Q_coords)} frames"
+            + (f" with mean correction {mean_delta_mm:.1f} mm." if np.isfinite(mean_delta_mm) else ".")
+        )
+
+    return Q_stabilized, stats
+
+
 def display_figures_trc(Q_unfilt, Q_filt, time_col, keypoints_names, person_id=0, show=True):
     '''
     Displays filtered and unfiltered data for comparison
@@ -839,8 +1079,12 @@ def filter_all(config_dict):
         if filter_ik:
             file_path_out = file_path_in.replace('.mot', f'_filt_{filter_type}.mot')
         else:
-            f_range = [[frames_col.iloc[0], frames_col.iloc[-1]]
-                       if (frame_range in ('all', 'auto', []) or frames_col.iloc[0]>frame_range[0] or frames_col.iloc[1]<frame_range[1]) 
+            f_range = [[frames_col.iloc[0], frames_col.iloc[-1] + 1]
+                       if (
+                           frame_range in ('all', 'auto', [])
+                           or frames_col.iloc[0] > frame_range[0]
+                           or frames_col.iloc[-1] < frame_range[1] - 1
+                       )
                        else frame_range][0]
             f_index = [frames_col[frames_col==f_range[0]].index[0], frames_col[frames_col==f_range[1]-1].index[0]+1]
             Q_coords = Q_coords.iloc[f_index[0]:f_index[1]].reset_index(drop=True)
@@ -851,13 +1095,18 @@ def filter_all(config_dict):
             header[0] = header[0].replace(os.path.basename(file_path_in), file_out)
 
         # Filter coordinates
+        Q_filt = Q_coords.copy()
         if reject_outliers:
-            Q_coords = Q_coords.apply(hampel_filter, axis=0)  # Hampel filter for outlier rejection
+            Q_filt = Q_filt.apply(hampel_filter, axis=0)  # Hampel filter for outlier rejection
         
         if do_filter:
-            Q_filt = Q_coords.apply(filter1d, axis=0, args = [config_dict, filter_type, frame_rate])
+            Q_filt = Q_filt.apply(filter1d, axis=0, args = [config_dict, filter_type, frame_rate])
 
-        if not do_filter and not reject_outliers:
+        rigid_stats = []
+        if not filter_ik:
+            Q_filt, rigid_stats = stabilize_rigid_marker_groups_3d(config_dict, Q_filt, markers)
+
+        if not do_filter and not reject_outliers and not rigid_stats:
             logging.warning(f'reject_outliers and filter have been set to false. No further processing done on {file_path_in}.\n')
         
         else:
