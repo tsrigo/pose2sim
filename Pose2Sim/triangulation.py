@@ -51,8 +51,10 @@ import cv2
 import toml
 from tqdm import tqdm
 from collections import Counter
+from collections.abc import Mapping
 from anytree import RenderTree
 from anytree.importer import DictImporter
+from scipy.optimize import least_squares
 import logging
 
 from Pose2Sim.common import retrieve_calib_params, computeP, weighted_triangulation, \
@@ -74,6 +76,24 @@ __status__ = "Development"
 
 
 ## FUNCTIONS
+def _to_picklable_builtin(value):
+    '''
+    Convert toml parser container subclasses to built-in containers.
+
+    Windows multiprocessing starts fresh Python processes and pickles every
+    worker argument. The toml package represents inline tables with a local
+    DynamicInlineTableDict class, which cannot be pickled.
+    '''
+
+    if isinstance(value, Mapping):
+        return {key: _to_picklable_builtin(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_picklable_builtin(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_picklable_builtin(item) for item in value)
+    return value
+
+
 def count_persons_in_json(file_path):
     '''
     Count the number of persons in a json file.
@@ -603,6 +623,398 @@ def triangulation_from_best_cameras(config_dict, coords_2D_kpt, coords_2D_kpt_sw
     return Q, error_min, nb_cams_excluded, id_excluded_cams
 
 
+def parse_rigid_marker_groups(config_dict, keypoints_names):
+    '''
+    Read optional rigid-marker groups from Config.toml and map marker names to
+    triangulation column indices.
+    '''
+
+    triangulation_config = config_dict.get('triangulation', {})
+    raw_groups = triangulation_config.get('rigid_marker_groups', [])
+    if raw_groups in (None, False, []):
+        return []
+    if not isinstance(raw_groups, list):
+        logging.warning('rigid_marker_groups must be a list of marker-name lists. Ignoring rigid triangulation groups.')
+        return []
+
+    min_markers = triangulation_config.get('rigid_group_min_markers', 3)
+    groups = []
+    seen_groups = set()
+    for group_id, raw_group in enumerate(raw_groups):
+        group_name = None
+        markers = raw_group
+        if isinstance(raw_group, dict):
+            group_name = raw_group.get('name')
+            markers = raw_group.get('markers', raw_group.get('names', raw_group.get('keypoints')))
+        if isinstance(markers, str):
+            markers = [marker.strip() for marker in markers.split(',') if marker.strip()]
+        if not markers:
+            logging.warning(f'Rigid marker group {group_id} has no markers. Skipping it.')
+            continue
+
+        present_markers = []
+        missing_markers = []
+        for marker in markers:
+            if marker in keypoints_names and marker not in present_markers:
+                present_markers.append(marker)
+            else:
+                missing_markers.append(marker)
+
+        if missing_markers:
+            logging.warning(
+                f"Rigid marker group {group_name or group_id} skipped missing markers: {missing_markers}."
+            )
+        if len(present_markers) < min_markers:
+            logging.warning(
+                f"Rigid marker group {group_name or group_id} needs at least {min_markers} available markers. "
+                f"Only found {present_markers}. Skipping it."
+            )
+            continue
+
+        indices = [keypoints_names.index(marker) for marker in present_markers]
+        group_key = tuple(indices)
+        if group_key in seen_groups:
+            continue
+        seen_groups.add(group_key)
+        groups.append({
+            'name': group_name or '+'.join(present_markers),
+            'markers': present_markers,
+            'indices': indices,
+        })
+
+    return groups
+
+
+def _rigid_group_columns(keypoint_indices):
+    return np.array([keypoint_idx * 3 + axis for keypoint_idx in keypoint_indices for axis in range(3)], dtype=int)
+
+
+def _extract_group_points(Q_df, keypoint_indices):
+    columns = _rigid_group_columns(keypoint_indices)
+    return Q_df.iloc[:, columns].to_numpy(dtype=float).reshape(len(Q_df), len(keypoint_indices), 3)
+
+
+def _build_rigid_template(group_points, group_name, config_dict):
+    triangulation_config = config_dict.get('triangulation', {})
+    min_template_frames = triangulation_config.get('rigid_group_template_min_frames', 20)
+    mad_factor = triangulation_config.get('rigid_group_template_mad_factor', 5.0)
+    distance_floor_m = triangulation_config.get('rigid_group_template_distance_floor_m', 0.02)
+
+    complete_frames = np.all(np.isfinite(group_points), axis=(1, 2))
+    if np.count_nonzero(complete_frames) < 3:
+        logging.warning(
+            f'Rigid marker group {group_name} has fewer than 3 complete baseline frames. '
+            'Keeping independent triangulation for this group.'
+        )
+        return None
+
+    candidate_points = group_points[complete_frames]
+    if len(candidate_points) < min_template_frames:
+        logging.warning(
+            f'Rigid marker group {group_name} has only {len(candidate_points)} complete template frames '
+            f'(requested {min_template_frames}). Using the available frames.'
+        )
+
+    if candidate_points.shape[1] >= 2 and len(candidate_points) >= 5:
+        pairwise_distances = []
+        for marker_i, marker_j in it.combinations(range(candidate_points.shape[1]), 2):
+            pairwise_distances.append(np.linalg.norm(candidate_points[:, marker_i] - candidate_points[:, marker_j], axis=1))
+        pairwise_distances = np.array(pairwise_distances).T
+        median_distances = np.nanmedian(pairwise_distances, axis=0)
+        mad_distances = np.nanmedian(np.abs(pairwise_distances - median_distances), axis=0)
+        thresholds = np.maximum(distance_floor_m, mad_factor * 1.4826 * mad_distances)
+        stable_frames = np.all(np.abs(pairwise_distances - median_distances) <= thresholds, axis=1)
+        if np.count_nonzero(stable_frames) >= 3:
+            candidate_points = candidate_points[stable_frames]
+
+    centered_points = candidate_points - np.mean(candidate_points, axis=1, keepdims=True)
+    template = np.nanmedian(centered_points, axis=0)
+    template = template - np.mean(template, axis=0, keepdims=True)
+    if not np.all(np.isfinite(template)):
+        logging.warning(f'Rigid marker group {group_name} produced a non-finite template. Skipping it.')
+        return None
+    return template
+
+
+def _initial_rigid_params(template, baseline_points):
+    valid_markers = np.all(np.isfinite(baseline_points), axis=1)
+    if np.count_nonzero(valid_markers) < 1:
+        return np.zeros(6)
+
+    source = template[valid_markers]
+    target = baseline_points[valid_markers]
+    if len(source) >= 3:
+        source_centroid = source.mean(axis=0)
+        target_centroid = target.mean(axis=0)
+        source_centered = source - source_centroid
+        target_centered = target - target_centroid
+        U, _, Vt = np.linalg.svd(source_centered.T @ target_centered)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+        t = target_centroid - R @ source_centroid
+        rvec = cv2.Rodrigues(R)[0].ravel()
+        return np.concatenate([rvec, t])
+
+    t = np.mean(target - source, axis=0)
+    return np.concatenate([np.zeros(3), t])
+
+
+def _rigid_points_from_params(params, template):
+    R = cv2.Rodrigues(params[:3])[0]
+    return (R @ template.T).T + params[3:6]
+
+
+def _project_rigid_point(projection_matrix, point):
+    point_h = np.append(point, 1.0)
+    projected = projection_matrix @ point_h
+    if not np.isfinite(projected[2]) or projected[2] == 0:
+        return np.array([np.nan, np.nan])
+    return projected[:2] / projected[2]
+
+
+def _rigid_group_residuals(params, template, x_obs, y_obs, likelihood_obs, projection_matrices, camera_ids):
+    points = _rigid_points_from_params(params, template)
+    residuals = []
+    for cam_id in camera_ids:
+        for marker_id, point in enumerate(points):
+            if not (
+                np.isfinite(x_obs[cam_id, marker_id])
+                and np.isfinite(y_obs[cam_id, marker_id])
+                and np.isfinite(likelihood_obs[cam_id, marker_id])
+                and likelihood_obs[cam_id, marker_id] > 0
+            ):
+                continue
+            projected = _project_rigid_point(projection_matrices[cam_id], point)
+            if not np.all(np.isfinite(projected)):
+                continue
+            weight = np.sqrt(max(float(likelihood_obs[cam_id, marker_id]), 0.0))
+            residuals.extend((projected - np.array([x_obs[cam_id, marker_id], y_obs[cam_id, marker_id]])) * weight)
+    if not residuals:
+        return np.array([1e6])
+    return np.array(residuals)
+
+
+def _rigid_reprojection_error(points, x_obs, y_obs, likelihood_obs, projection_matrices, camera_ids):
+    marker_errors = [[] for _ in range(points.shape[0])]
+    all_errors = []
+    for cam_id in camera_ids:
+        for marker_id, point in enumerate(points):
+            if not (
+                np.isfinite(x_obs[cam_id, marker_id])
+                and np.isfinite(y_obs[cam_id, marker_id])
+                and np.isfinite(likelihood_obs[cam_id, marker_id])
+                and likelihood_obs[cam_id, marker_id] > 0
+            ):
+                continue
+            projected = _project_rigid_point(projection_matrices[cam_id], point)
+            if not np.all(np.isfinite(projected)):
+                continue
+            observed = np.array([x_obs[cam_id, marker_id], y_obs[cam_id, marker_id]])
+            error = euclidean_distance(projected, observed)
+            marker_errors[marker_id].append(error)
+            all_errors.append(error)
+
+    if not all_errors:
+        return np.nan, np.full(points.shape[0], np.nan)
+    return float(np.mean(all_errors)), np.array([
+        float(np.mean(errors)) if errors else np.nan for errors in marker_errors
+    ])
+
+
+def _fit_rigid_group_frame(config_dict, template, baseline_points, x_obs, y_obs, likelihood_obs, projection_matrices):
+    triangulation_config = config_dict.get('triangulation', {})
+    error_threshold = triangulation_config.get(
+        'rigid_group_reproj_error_threshold',
+        triangulation_config.get('reproj_error_threshold_triangulation', 15),
+    )
+    min_cameras = triangulation_config.get('min_cameras_for_triangulation', 2)
+    min_markers = triangulation_config.get('rigid_group_min_markers', 3)
+    max_nfev = triangulation_config.get('rigid_group_max_nfev', 80)
+    loss = triangulation_config.get('rigid_group_loss', 'soft_l1')
+    loss_scale = triangulation_config.get('rigid_group_loss_scale_px', 5.0)
+
+    valid_observations = (
+        np.isfinite(x_obs)
+        & np.isfinite(y_obs)
+        & np.isfinite(likelihood_obs)
+        & (likelihood_obs > 0)
+    )
+    n_cams = len(projection_matrices)
+    if np.count_nonzero(valid_observations.any(axis=1)) < min_cameras:
+        return None
+    if np.count_nonzero(valid_observations.any(axis=0)) < min_markers:
+        return None
+
+    initial_params = _initial_rigid_params(template, baseline_points)
+    best_fit = None
+    max_cams_to_exclude = n_cams - min_cameras
+    for nb_cams_off in range(max_cams_to_exclude + 1):
+        for excluded_cams in it.combinations(range(n_cams), nb_cams_off):
+            camera_ids = [cam_id for cam_id in range(n_cams) if cam_id not in excluded_cams]
+            used_camera_ids = [cam_id for cam_id in camera_ids if valid_observations[cam_id].any()]
+            if len(used_camera_ids) < min_cameras:
+                continue
+            if np.count_nonzero(valid_observations[used_camera_ids].any(axis=0)) < min_markers:
+                continue
+            if np.count_nonzero(valid_observations[used_camera_ids]) * 2 < 6:
+                continue
+
+            result = least_squares(
+                _rigid_group_residuals,
+                initial_params,
+                args=(template, x_obs, y_obs, likelihood_obs, projection_matrices, used_camera_ids),
+                loss=loss,
+                f_scale=loss_scale,
+                max_nfev=max_nfev,
+            )
+            if not np.all(np.isfinite(result.x)):
+                continue
+            fitted_points = _rigid_points_from_params(result.x, template)
+            error, marker_errors = _rigid_reprojection_error(
+                fitted_points, x_obs, y_obs, likelihood_obs, projection_matrices, used_camera_ids
+            )
+            if not np.isfinite(error):
+                continue
+            deliberately_excluded = set(range(n_cams)) - set(used_camera_ids)
+            candidate = {
+                'points': fitted_points,
+                'params': result.x,
+                'error': error,
+                'marker_errors': marker_errors,
+                'excluded_cams': sorted(deliberately_excluded),
+                'used_cams': used_camera_ids,
+            }
+            if best_fit is None or candidate['error'] < best_fit['error']:
+                best_fit = candidate
+
+        if best_fit is not None and best_fit['error'] <= error_threshold:
+            break
+
+    if best_fit is None or best_fit['error'] > error_threshold:
+        return None
+    return best_fit
+
+
+def _smooth_rigid_params(fits, config_dict):
+    window = config_dict.get('triangulation', {}).get('rigid_group_smoothing_window', 5)
+    if window in (None, False) or window <= 1:
+        return [fit.get('params') if fit is not None else None for fit in fits]
+
+    params = np.full((len(fits), 6), np.nan)
+    for frame_id, fit in enumerate(fits):
+        if fit is not None:
+            params[frame_id] = fit['params']
+    if np.count_nonzero(np.all(np.isfinite(params), axis=1)) < 2:
+        return [fit.get('params') if fit is not None else None for fit in fits]
+
+    params_df = pd.DataFrame(params)
+    smoothed = params_df.rolling(
+        window=int(window),
+        center=True,
+        min_periods=1,
+    ).median().to_numpy()
+    return [
+        smoothed[frame_id] if fit is not None and np.all(np.isfinite(smoothed[frame_id])) else (
+            fit.get('params') if fit is not None else None
+        )
+        for frame_id, fit in enumerate(fits)
+    ]
+
+
+def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df, id_excluded_cams_df,
+                               observations, projection_matrices, rigid_groups, id_person=0):
+    '''
+    Replace independently triangulated marker coordinates by a rigid transform
+    fit for configured marker groups. Falls back frame-by-frame when the joint
+    reprojection fit does not meet the configured threshold.
+    '''
+
+    if not rigid_groups or observations is None:
+        return []
+
+    x_obs = observations.get('x')
+    y_obs = observations.get('y')
+    likelihood_obs = observations.get('likelihood')
+    if x_obs is None or y_obs is None or likelihood_obs is None:
+        return []
+    if len(x_obs) != len(Q_df):
+        logging.warning(
+            f'Rigid triangulation observations ({len(x_obs)} frames) do not match '
+            f'3D results ({len(Q_df)} frames). Skipping rigid refinement for person {id_person}.'
+        )
+        return []
+
+    stats = []
+    for group in rigid_groups:
+        group_name = group['name']
+        keypoint_indices = group['indices']
+        group_points = _extract_group_points(Q_df, keypoint_indices)
+        template = _build_rigid_template(group_points, group_name, config_dict)
+        if template is None:
+            stats.append({'name': group_name, 'accepted': 0, 'total': len(Q_df), 'mean_error': np.nan})
+            continue
+
+        fits = []
+        for row_id in range(len(Q_df)):
+            fits.append(_fit_rigid_group_frame(
+                config_dict,
+                template,
+                group_points[row_id],
+                x_obs[row_id][:, keypoint_indices],
+                y_obs[row_id][:, keypoint_indices],
+                likelihood_obs[row_id][:, keypoint_indices],
+                projection_matrices,
+            ))
+
+        accepted_frames = 0
+        accepted_errors = []
+        columns = _rigid_group_columns(keypoint_indices)
+        smoothed_params = _smooth_rigid_params(fits, config_dict)
+        for row_id, fit in enumerate(fits):
+            if fit is None:
+                continue
+
+            points = _rigid_points_from_params(smoothed_params[row_id], template)
+            error, marker_errors = _rigid_reprojection_error(
+                points,
+                x_obs[row_id][:, keypoint_indices],
+                y_obs[row_id][:, keypoint_indices],
+                likelihood_obs[row_id][:, keypoint_indices],
+                projection_matrices,
+                fit['used_cams'],
+            )
+            if not np.isfinite(error):
+                points = fit['points']
+                error = fit['error']
+                marker_errors = fit['marker_errors']
+
+            Q_df.iloc[row_id, columns] = points.reshape(-1)
+            for local_marker_id, keypoint_idx in enumerate(keypoint_indices):
+                marker_error = marker_errors[local_marker_id]
+                error_df.iat[row_id, keypoint_idx] = marker_error if np.isfinite(marker_error) else error
+                nb_cams_excluded_df.iat[row_id, keypoint_idx] = len(fit['excluded_cams'])
+                id_excluded_cams_df.iat[row_id, keypoint_idx] = fit['excluded_cams']
+            accepted_frames += 1
+            accepted_errors.append(error)
+
+        mean_error = float(np.mean(accepted_errors)) if accepted_errors else np.nan
+        stats.append({
+            'name': group_name,
+            'accepted': accepted_frames,
+            'total': len(Q_df),
+            'mean_error': mean_error,
+        })
+        logging.info(
+            f"Rigid marker group {group_name} for person {id_person}: accepted "
+            f"{accepted_frames}/{len(Q_df)} frames"
+            + (f" with mean joint reprojection error {mean_error:.1f} px." if np.isfinite(mean_error) else ".")
+        )
+
+    return stats
+
+
 def extract_files_frame_f(json_tracked_files_f, keypoints_ids, nb_persons_to_detect):
     '''
     Extract data from json files for frame f, 
@@ -655,7 +1067,7 @@ def extract_files_frame_f(json_tracked_files_f, keypoints_ids, nb_persons_to_det
 def triangulate_single_frame(f, json_dirs_names, json_files_names, pose_dir,
                              keypoints_ids, keypoints_idx, keypoints_idx_swapped,
                              nb_persons_to_detect, n_cams, P, calib_params,
-                             config_dict, undistort_points):
+                             config_dict, undistort_points, return_observations=False):
     '''
     Pure per-frame triangulation function for process-based parallelism.
     '''
@@ -703,6 +1115,13 @@ def triangulate_single_frame(f, json_dirs_names, json_files_names, pose_dir,
             nb_cams_excluded[n].append(nb_cams_excluded_kpt)
             id_excluded_cams[n].append(id_excluded_cams_kpt)
 
+    if return_observations:
+        observations = {
+            'x': x_files,
+            'y': y_files,
+            'likelihood': likelihood_files,
+        }
+        return Q, error, nb_cams_excluded, id_excluded_cams, observations
     return Q, error, nb_cams_excluded, id_excluded_cams
 
 
@@ -788,6 +1207,7 @@ def triangulate_all(config_dict):
     keypoints_names = [node.name for _, _, node in RenderTree(model) if node.id!=None]
     keypoints_idx = list(range(len(keypoints_ids)))
     keypoints_nb = len(keypoints_ids)
+    rigid_groups = parse_rigid_marker_groups(config_dict, keypoints_names)
     # for pre, _, node in RenderTree(model): 
     #     print(f'{pre}{node.name} id={node.id}')
     
@@ -846,6 +1266,7 @@ def triangulate_all(config_dict):
     nb_cams_excluded = [[] for n in range(nb_persons_to_detect)]
     id_excluded_cams = [[] for n in range(nb_persons_to_detect)]
     Q_tot, error_tot, nb_cams_excluded_tot, cam_excluded_count, id_excluded_cams_tot = [], [], [], [], []
+    observations_tot = [{'x': [], 'y': [], 'likelihood': []} for _ in range(nb_persons_to_detect)] if rigid_groups else None
     interp_frames, non_interp_frames, f_range_trimmed = [], [], []
     trc_paths, c3d_paths = [], []
     if parallel_triangulation not in ('auto', False) and not isinstance(parallel_triangulation, int):
@@ -864,6 +1285,7 @@ def triangulate_all(config_dict):
         from concurrent.futures import ProcessPoolExecutor
 
         logging.info(f'Triangulating frames in parallel with {triangulation_workers} worker processes.')
+        worker_config_dict = _to_picklable_builtin(config_dict)
         chunksize = max(1, frame_nb // max(1, triangulation_workers * 4))
         with ProcessPoolExecutor(max_workers=triangulation_workers) as executor:
             frame_results = list(tqdm(
@@ -880,8 +1302,9 @@ def triangulate_all(config_dict):
                     it.repeat(n_cams),
                     it.repeat(P),
                     it.repeat(calib_params),
-                    it.repeat(config_dict),
+                    it.repeat(worker_config_dict),
                     it.repeat(undistort_points),
+                    it.repeat(bool(rigid_groups)),
                     chunksize=chunksize,
                 ),
                 total=frame_nb,
@@ -891,13 +1314,19 @@ def triangulate_all(config_dict):
             triangulate_single_frame(
                 f, json_dirs_names, json_files_names, pose_dir, keypoints_ids, keypoints_idx,
                 keypoints_idx_swapped, nb_persons_to_detect, n_cams, P, calib_params,
-                config_dict, undistort_points,
+                config_dict, undistort_points, bool(rigid_groups),
             )
             for f in tqdm(frames_to_process)
         ]
 
     for f, frame_result in zip(range(*f_range), frame_results):
-        raw_Q, error, nb_cams_excluded, id_excluded_cams = frame_result
+        if rigid_groups:
+            raw_Q, error, nb_cams_excluded, id_excluded_cams, observations = frame_result
+            x_obs = np.array(observations['x'], dtype=np.float64)
+            y_obs = np.array(observations['y'], dtype=np.float64)
+            likelihood_obs = np.array(observations['likelihood'], dtype=np.float64)
+        else:
+            raw_Q, error, nb_cams_excluded, id_excluded_cams = frame_result
 
         nan_mask = np.isnan(Q)
         Q_old = np.where(nan_mask, Q_old, Q)
@@ -908,23 +1337,38 @@ def triangulate_all(config_dict):
                 Q_old, Q, sorted_ids = sort_people_sports2d(Q_old, Q, max_dist=max_distance_m)
 
                 error_sorted, nb_cams_excluded_sorted, id_excluded_cams_sorted = [], [], []
+                if rigid_groups:
+                    x_obs_sorted = np.full_like(x_obs, np.nan)
+                    y_obs_sorted = np.full_like(y_obs, np.nan)
+                    likelihood_obs_sorted = np.full_like(likelihood_obs, np.nan)
                 for n in range(nb_persons_to_detect):
                     detection_idx = sorted_ids[n]
                     if detection_idx >= 0:
                         error_sorted.append(error[detection_idx])
                         nb_cams_excluded_sorted.append(nb_cams_excluded[detection_idx])
                         id_excluded_cams_sorted.append(id_excluded_cams[detection_idx])
+                        if rigid_groups:
+                            x_obs_sorted[n] = x_obs[detection_idx]
+                            y_obs_sorted[n] = y_obs[detection_idx]
+                            likelihood_obs_sorted[n] = likelihood_obs[detection_idx]
                     else:
                         error_sorted.append([np.nan] * keypoints_nb)
                         nb_cams_excluded_sorted.append([n_cams] * keypoints_nb)
                         id_excluded_cams_sorted.append([list(range(n_cams))] * keypoints_nb)
                 error, nb_cams_excluded, id_excluded_cams = error_sorted, nb_cams_excluded_sorted, id_excluded_cams_sorted
+                if rigid_groups:
+                    x_obs, y_obs, likelihood_obs = x_obs_sorted, y_obs_sorted, likelihood_obs_sorted
 
         Q_tot.append([np.concatenate(Q[n]) for n in range(nb_persons_to_detect)])
         error_tot.append([error[n] for n in range(nb_persons_to_detect)])
         nb_cams_excluded_tot.append([nb_cams_excluded[n] for n in range(nb_persons_to_detect)])
         id_excluded_cams = [[id_excluded_cams[n][k] for k in range(keypoints_nb)] for n in range(nb_persons_to_detect)]
         id_excluded_cams_tot.append(id_excluded_cams)
+        if rigid_groups:
+            for n in range(nb_persons_to_detect):
+                observations_tot[n]['x'].append(x_obs[n])
+                observations_tot[n]['y'].append(y_obs[n])
+                observations_tot[n]['likelihood'].append(likelihood_obs[n])
             
     # fill values for if a person that was not initially detected has entered the frame 
     Q_tot = [list(tpl) for tpl in zip(*it.zip_longest(*Q_tot, fillvalue=[np.nan]*keypoints_nb*3))]
@@ -937,6 +1381,28 @@ def triangulate_all(config_dict):
     error_tot = [pd.DataFrame([error_tot_f[n] for error_tot_f in error_tot], index=range(*f_range)) for n in range(nb_persons_to_detect)]
     nb_cams_excluded_tot = [pd.DataFrame([nb_cams_excluded_tot_f[n] for nb_cams_excluded_tot_f in nb_cams_excluded_tot], index=range(*f_range)) for n in range(nb_persons_to_detect)]
     id_excluded_cams_tot = [pd.DataFrame([id_excluded_cams_tot_f[n] for id_excluded_cams_tot_f in id_excluded_cams_tot], index=range(*f_range)) for n in range(nb_persons_to_detect)]
+    if rigid_groups:
+        observations_tot = [
+            {key: np.array(value, dtype=np.float64) for key, value in observations.items()}
+            for observations in observations_tot
+        ]
+        logging.info(
+            '\nApplying rigid marker group triangulation to: '
+            + ', '.join(group['name'] for group in rigid_groups)
+            + '.'
+        )
+        for n in range(nb_persons_to_detect):
+            refine_rigid_marker_groups(
+                config_dict,
+                Q_tot[n],
+                error_tot[n],
+                nb_cams_excluded_tot[n],
+                id_excluded_cams_tot[n],
+                observations_tot[n],
+                P,
+                rigid_groups,
+                id_person=n,
+            )
 
     # Interpolate small missing sections
     for n in range(nb_persons_to_detect):
