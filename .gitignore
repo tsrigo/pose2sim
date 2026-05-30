@@ -18,3 +18,25 @@ dist/
 **/pose-sync/
 **/pose-associated/
 **/kinematics/
+
+# Local debug / intermediate artifacts (not for upstream)
+/data/
+/deliverables/
+/PRCDemo/
+/images/
+figures/*/
+*.pt
+docs/*.pdf
+/skeletons(1).py
+# stray hash-named debug screenshots at repo root
+/bf8c11b13aa3026142ee739edaa9119f.png
+/ecf26cb2577f5448684e061f5494406f.png
+# ad-hoc debug scripts (keep substantial analysis scripts only)
+scripts/__pycache__/
+scripts/*.traj
+scripts/diagnose_*
+scripts/fix_trc_jitter*
+scripts/inspect_*
+scripts/plot_*
+scripts/compare_trc_full.py
+scripts/run_trc_exp.py

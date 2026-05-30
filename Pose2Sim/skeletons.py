@@ -8,7 +8,7 @@
 ###########################################################################
 
 The definition and hierarchy of the following skeletons are available: 
-- RTMPose HALPE_26, COCO_133, COCO_133_WRIST, COCO_17, HAND, FACE, ANIMAL
+- RTMPose HALPE_26, COCO_133, COCO_133_WRIST, COCO_17, COCO_25, HAND, FACE, ANIMAL
 - OpenPose BODY_25B, BODY_25, BODY_135, COCO, MPII
 - Mediapipe BLAZEPOSE
 - AlphaPose HALPE_26, HALPE_68, HALPE_136, COCO_133, COCO, MPII 
@@ -51,9 +51,8 @@ HALPE_26 = Node("Hip", id=19, children=[
     Node("RHip", id=12, children=[
         Node("RKnee", id=14, children=[
             Node("RAnkle", id=16, children=[
-                Node("RBigToe", id=21, children=[
-                    Node("RSmallToe", id=23),
-                ]),
+                Node("RBigToe", id=21),
+                Node("RSmallToe", id=23),
                 Node("RHeel", id=25),
             ]),
         ]),
@@ -61,9 +60,8 @@ HALPE_26 = Node("Hip", id=19, children=[
     Node("LHip", id=11, children=[
         Node("LKnee", id=13, children=[
             Node("LAnkle", id=15, children=[
-                Node("LBigToe", id=20, children=[
-                    Node("LSmallToe", id=22),
-                ]),
+                Node("LBigToe", id=20),
+                Node("LSmallToe", id=22),
                 Node("LHeel", id=24),
             ]),
         ]),
@@ -755,6 +753,50 @@ BODY_25 = Node("CHip", id=8, children=[
         Node("LShoulder", id=5, children=[
             Node("LElbow", id=6, children=[
                 Node("LWrist", id=7),
+            ]),
+        ]),
+    ]),
+])
+
+
+'''COCO_25 (full-body without hands, from easy_ViTPose/RTMLib coco_25 models)
+The index order follows rtmlib.visualization.skeleton.coco25.'''
+COCO_25 = Node("Hip", id=14, children=[
+    Node("RHip", id=13, children=[
+        Node("RKnee", id=16, children=[
+            Node("RAnkle", id=18, children=[
+                Node("RBigToe", id=22, children=[
+                    Node("RSmallToe", id=23),
+                ]),
+                Node("RHeel", id=24),
+            ]),
+        ]),
+    ]),
+    Node("LHip", id=12, children=[
+        Node("LKnee", id=15, children=[
+            Node("LAnkle", id=17, children=[
+                Node("LBigToe", id=19, children=[
+                    Node("LSmallToe", id=20),
+                ]),
+                Node("LHeel", id=21),
+            ]),
+        ]),
+    ]),
+    Node("Neck", id=5, children=[
+        Node("Nose", id=0, children=[
+            Node("REye", id=2),
+            Node("LEye", id=1),
+            Node("REar", id=4),
+            Node("LEar", id=3),
+        ]),
+        Node("RShoulder", id=7, children=[
+            Node("RElbow", id=9, children=[
+                Node("RWrist", id=11),
+            ]),
+        ]),
+        Node("LShoulder", id=6, children=[
+            Node("LElbow", id=8, children=[
+                Node("LWrist", id=10),
             ]),
         ]),
     ]),

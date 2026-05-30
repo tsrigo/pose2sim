@@ -722,6 +722,272 @@ def _rigid_points_from_3d_params(params, template):
     return (R @ template.T).T + params[3:6]
 
 
+def _optional_filter_float(filter_config, key, default):
+    value = filter_config.get(key, default)
+    if value in (None, False):
+        return None
+    return float(value)
+
+
+def _pairwise_distance_change_ratio(reference_points, candidate_points, valid_markers):
+    ratios = []
+    for marker_i in range(len(reference_points)):
+        for marker_j in range(marker_i + 1, len(reference_points)):
+            if not (valid_markers[marker_i] and valid_markers[marker_j]):
+                continue
+            reference_distance = np.linalg.norm(reference_points[marker_i] - reference_points[marker_j])
+            candidate_distance = np.linalg.norm(candidate_points[marker_i] - candidate_points[marker_j])
+            if not np.isfinite(reference_distance) or not np.isfinite(candidate_distance):
+                continue
+            if reference_distance <= 1e-9:
+                if candidate_distance > 1e-9:
+                    ratios.append(np.inf)
+                continue
+            ratios.append(abs(candidate_distance - reference_distance) / reference_distance)
+
+    return max(ratios) if ratios else 0.0
+
+
+def _pairwise_template_deviation_ratio(template, candidate_points, valid_markers):
+    ratios = []
+    for marker_i in range(len(template)):
+        for marker_j in range(marker_i + 1, len(template)):
+            if not (valid_markers[marker_i] and valid_markers[marker_j]):
+                continue
+            template_distance = np.linalg.norm(template[marker_i] - template[marker_j])
+            candidate_distance = np.linalg.norm(candidate_points[marker_i] - candidate_points[marker_j])
+            if not np.isfinite(template_distance) or not np.isfinite(candidate_distance):
+                continue
+            if template_distance <= 1e-9:
+                if candidate_distance > 1e-9:
+                    ratios.append(np.inf)
+                continue
+            ratios.append(abs(candidate_distance - template_distance) / template_distance)
+
+    return max(ratios) if ratios else 0.0
+
+
+def _update_3d_guard_delta_stats(stats, original_points, corrected_points):
+    finite_original = np.all(np.isfinite(original_points), axis=1)
+    finite_corrected = np.all(np.isfinite(corrected_points), axis=1)
+    changed_markers = finite_original & finite_corrected
+    stats['delta_mm'] = []
+    stats['applied'] = False
+    if np.any(changed_markers):
+        deltas_mm = np.linalg.norm(corrected_points[changed_markers] - original_points[changed_markers], axis=1) * 1000.0
+        stats['delta_mm'] = [float(delta) for delta in deltas_mm if np.isfinite(delta)]
+        stats['applied'] = bool(np.any(deltas_mm > 0))
+    if np.any((~finite_original) & finite_corrected):
+        stats['applied'] = True
+    return stats
+
+
+def _limit_3d_rigid_correction_step(config_dict, original_points, corrected_points, previous_original_points,
+                                    previous_corrected_points):
+    filter_config = _filter_rigid_group_config(config_dict)
+    max_correction_step_m = _optional_filter_float(filter_config, 'rigid_group_max_correction_step_m', 0.015)
+    if (
+        max_correction_step_m is None
+        or max_correction_step_m < 0
+        or previous_original_points is None
+        or previous_corrected_points is None
+    ):
+        return corrected_points, False
+
+    valid_markers = (
+        np.all(np.isfinite(original_points), axis=1)
+        & np.all(np.isfinite(corrected_points), axis=1)
+        & np.all(np.isfinite(previous_original_points), axis=1)
+        & np.all(np.isfinite(previous_corrected_points), axis=1)
+    )
+    if not np.any(valid_markers):
+        return corrected_points, False
+
+    target_correction = corrected_points - original_points
+    previous_correction = previous_corrected_points - previous_original_points
+    correction_change = target_correction[valid_markers] - previous_correction[valid_markers]
+    correction_change_norms = np.linalg.norm(correction_change, axis=1)
+    max_correction_change = np.nanmax(correction_change_norms) if len(correction_change_norms) else 0.0
+    if not np.isfinite(max_correction_change) or max_correction_change <= max_correction_step_m:
+        return corrected_points, False
+
+    scale = max_correction_step_m / max_correction_change
+    limited_points = original_points.copy()
+    limited_points[valid_markers] = (
+        original_points[valid_markers]
+        + previous_correction[valid_markers]
+        + scale * correction_change
+    )
+    return limited_points, True
+
+
+def _repair_3d_rigid_pairwise_spikes(config_dict, group_points):
+    filter_config = _filter_rigid_group_config(config_dict)
+    if not bool(filter_config.get('rigid_group_repair_pairwise_spikes', False)):
+        return group_points, 0
+
+    max_gap = int(filter_config.get('rigid_group_spike_max_gap', 5))
+    window = int(filter_config.get('rigid_group_spike_window', 31))
+    max_ratio = _optional_filter_float(filter_config, 'rigid_group_spike_pairwise_change_ratio', 0.25)
+    min_abs_m = _optional_filter_float(filter_config, 'rigid_group_spike_min_abs_m', 0.03)
+    min_bad_pairs = int(filter_config.get('rigid_group_spike_min_bad_pairs', 2))
+    if max_gap < 1 or max_ratio is None or max_ratio < 0:
+        return group_points, 0
+
+    repaired = np.array(group_points, dtype=np.float64, copy=True)
+    frame_count, marker_count, _ = repaired.shape
+    if frame_count < 3 or marker_count < 3:
+        return repaired, 0
+
+    pair_ids = [(i, j) for i in range(marker_count) for j in range(i + 1, marker_count)]
+    distances = np.full((frame_count, len(pair_ids)), np.nan, dtype=np.float64)
+    for pair_id, (marker_i, marker_j) in enumerate(pair_ids):
+        pair_points = repaired[:, marker_i] - repaired[:, marker_j]
+        valid = np.isfinite(pair_points).all(axis=1)
+        distances[valid, pair_id] = np.linalg.norm(pair_points[valid], axis=1)
+
+    local_reference = pd.DataFrame(distances).rolling(
+        window=max(3, window),
+        center=True,
+        min_periods=3,
+    ).median().to_numpy()
+    abs_deviation = np.abs(distances - local_reference)
+    denominator = np.maximum(np.abs(local_reference), 1e-6)
+    bad_pairs = (abs_deviation / denominator) > max_ratio
+    if min_abs_m is not None and min_abs_m > 0:
+        bad_pairs &= abs_deviation > min_abs_m
+    bad_pairs &= np.isfinite(abs_deviation)
+
+    marker_bad = np.zeros((frame_count, marker_count), dtype=bool)
+    for frame_id in range(frame_count):
+        if np.count_nonzero(bad_pairs[frame_id]) < min_bad_pairs:
+            continue
+        marker_scores = np.zeros(marker_count, dtype=np.float64)
+        for pair_id, (marker_i, marker_j) in enumerate(pair_ids):
+            if not bad_pairs[frame_id, pair_id]:
+                continue
+            deviation = abs_deviation[frame_id, pair_id]
+            if not np.isfinite(deviation):
+                continue
+            marker_scores[marker_i] += deviation
+            marker_scores[marker_j] += deviation
+        if np.nanmax(marker_scores) <= 0:
+            continue
+        marker_bad[frame_id, int(np.nanargmax(marker_scores))] = True
+
+    repaired_count = 0
+    for marker_id in range(marker_count):
+        bad_indices = np.flatnonzero(marker_bad[:, marker_id])
+        if len(bad_indices) == 0:
+            continue
+        chunks = np.split(bad_indices, np.where(np.diff(bad_indices) > 1)[0] + 1)
+        for chunk in chunks:
+            if len(chunk) == 0 or len(chunk) > max_gap:
+                continue
+            start = int(chunk[0])
+            end = int(chunk[-1])
+            prev_idx = start - 1
+            while prev_idx >= 0 and (
+                marker_bad[prev_idx, marker_id]
+                or not np.all(np.isfinite(repaired[prev_idx, marker_id]))
+            ):
+                prev_idx -= 1
+            next_idx = end + 1
+            while next_idx < frame_count and (
+                marker_bad[next_idx, marker_id]
+                or not np.all(np.isfinite(repaired[next_idx, marker_id]))
+            ):
+                next_idx += 1
+            if prev_idx < 0 or next_idx >= frame_count:
+                continue
+            for frame_id in chunk:
+                alpha = (frame_id - prev_idx) / (next_idx - prev_idx)
+                repaired[frame_id, marker_id] = (
+                    (1.0 - alpha) * repaired[prev_idx, marker_id]
+                    + alpha * repaired[next_idx, marker_id]
+                )
+                repaired_count += 1
+
+    return repaired, repaired_count
+
+
+def _guarded_3d_rigid_points(config_dict, template, original_points, rigid_points):
+    filter_config = _filter_rigid_group_config(config_dict)
+    blend = float(filter_config.get('rigid_group_blend', 0.7))
+    blend = float(np.clip(blend, 0.0, 1.0))
+    max_correction_m = _optional_filter_float(filter_config, 'rigid_group_max_correction_m', 0.05)
+    max_pairwise_change_ratio = _optional_filter_float(filter_config, 'rigid_group_max_pairwise_change_ratio', 0.15)
+    fill_missing = bool(filter_config.get('rigid_group_fill_missing', False))
+
+    finite_original = np.all(np.isfinite(original_points), axis=1)
+    finite_rigid = np.all(np.isfinite(rigid_points), axis=1)
+    blended_markers = finite_original & finite_rigid
+    filled_markers = (~finite_original) & finite_rigid if fill_missing else np.zeros_like(finite_rigid, dtype=bool)
+
+    stats = {
+        'applied': False,
+        'effective_blend': blend,
+        'correction_limited': False,
+        'pairwise_guarded': False,
+        'pairwise_rejected': False,
+        'step_limited': False,
+        'delta_mm': [],
+    }
+    if not np.any(blended_markers) and not np.any(filled_markers):
+        return original_points, stats
+
+    if max_correction_m is not None and max_correction_m >= 0 and np.any(blended_markers):
+        correction_norms = np.linalg.norm(rigid_points[blended_markers] - original_points[blended_markers], axis=1)
+        max_full_correction = np.nanmax(correction_norms) if len(correction_norms) else 0.0
+        if np.isfinite(max_full_correction) and max_full_correction > 0 and blend * max_full_correction > max_correction_m:
+            blend = max_correction_m / max_full_correction
+            stats['correction_limited'] = True
+
+    def build_candidate(candidate_blend):
+        candidate_points = original_points.copy()
+        if np.any(blended_markers):
+            candidate_points[blended_markers] = (
+                (1.0 - candidate_blend) * original_points[blended_markers]
+                + candidate_blend * rigid_points[blended_markers]
+            )
+        if np.any(filled_markers):
+            candidate_points[filled_markers] = rigid_points[filled_markers]
+        return candidate_points
+
+    corrected_points = build_candidate(blend)
+    if max_pairwise_change_ratio is not None and max_pairwise_change_ratio >= 0 and np.any(blended_markers):
+        original_deviation = _pairwise_template_deviation_ratio(template, original_points, blended_markers)
+        corrected_deviation = _pairwise_template_deviation_ratio(template, corrected_points, blended_markers)
+        if (
+            np.isfinite(original_deviation)
+            and np.isfinite(corrected_deviation)
+            and corrected_deviation > original_deviation + 1e-12
+        ):
+            blend = 0.0
+            corrected_points = build_candidate(blend)
+            stats['pairwise_rejected'] = True
+        elif np.isfinite(original_deviation) and original_deviation <= max_pairwise_change_ratio:
+            change_ratio = _pairwise_distance_change_ratio(original_points, corrected_points, blended_markers)
+            if change_ratio > max_pairwise_change_ratio:
+                stats['pairwise_guarded'] = True
+                low_blend, high_blend = 0.0, blend
+                for _ in range(24):
+                    mid_blend = (low_blend + high_blend) / 2.0
+                    mid_points = build_candidate(mid_blend)
+                    mid_ratio = _pairwise_distance_change_ratio(original_points, mid_points, blended_markers)
+                    if mid_ratio <= max_pairwise_change_ratio:
+                        low_blend = mid_blend
+                    else:
+                        high_blend = mid_blend
+                blend = low_blend
+                corrected_points = build_candidate(blend)
+                if blend <= 1e-6 and not np.any(filled_markers):
+                    stats['pairwise_rejected'] = True
+
+    stats['effective_blend'] = blend
+    return corrected_points, _update_3d_guard_delta_stats(stats, original_points, corrected_points)
+
+
 def stabilize_rigid_marker_groups_3d(config_dict, Q_coords, markers):
     '''
     Stabilize configured 3D marker groups as approximate rigid bodies.
@@ -738,9 +1004,6 @@ def stabilize_rigid_marker_groups_3d(config_dict, Q_coords, markers):
     filter_config = _filter_rigid_group_config(config_dict)
     min_markers = int(filter_config.get('rigid_group_min_markers', 3))
     smoothing_window = int(filter_config.get('rigid_group_smoothing_window', 31))
-    blend = float(filter_config.get('rigid_group_blend', 0.7))
-    fill_missing = bool(filter_config.get('rigid_group_fill_missing', False))
-    blend = float(np.clip(blend, 0.0, 1.0))
 
     Q_stabilized = Q_coords.copy()
     stats = []
@@ -751,7 +1014,19 @@ def stabilize_rigid_marker_groups_3d(config_dict, Q_coords, markers):
         group_points = _extract_marker_points(Q_stabilized, marker_indices)
         template = _build_3d_rigid_template(group_points, group_name, config_dict)
         if template is None:
-            stats.append({'name': group_name, 'accepted': 0, 'total': len(Q_coords), 'mean_delta_mm': np.nan})
+            stats.append({
+                'name': group_name,
+                'accepted': 0,
+                'applied': 0,
+                'total': len(Q_coords),
+                'mean_delta_mm': np.nan,
+                'max_delta_mm': np.nan,
+                'correction_limited': 0,
+                'pairwise_guarded': 0,
+                'pairwise_rejected': 0,
+                'step_limited': 0,
+                'spike_repaired': 0,
+            })
             continue
 
         params = np.full((len(group_points), 6), np.nan)
@@ -761,7 +1036,19 @@ def stabilize_rigid_marker_groups_3d(config_dict, Q_coords, markers):
                 params[frame_id] = frame_params
 
         if np.count_nonzero(np.all(np.isfinite(params), axis=1)) == 0:
-            stats.append({'name': group_name, 'accepted': 0, 'total': len(Q_coords), 'mean_delta_mm': np.nan})
+            stats.append({
+                'name': group_name,
+                'accepted': 0,
+                'applied': 0,
+                'total': len(Q_coords),
+                'mean_delta_mm': np.nan,
+                'max_delta_mm': np.nan,
+                'correction_limited': 0,
+                'pairwise_guarded': 0,
+                'pairwise_rejected': 0,
+                'step_limited': 0,
+                'spike_repaired': 0,
+            })
             continue
 
         if smoothing_window > 1:
@@ -772,46 +1059,80 @@ def stabilize_rigid_marker_groups_3d(config_dict, Q_coords, markers):
             ).median().to_numpy()
 
         accepted_frames = 0
+        applied_frames = 0
+        correction_limited_frames = 0
+        pairwise_guarded_frames = 0
+        pairwise_rejected_frames = 0
+        step_limited_frames = 0
+        spike_repaired_frames = 0
         deltas_mm = []
+        previous_original_points = None
+        previous_corrected_points = None
         for frame_id, frame_params in enumerate(params):
             if not np.all(np.isfinite(frame_params)):
                 continue
             rigid_points = _rigid_points_from_3d_params(frame_params, template)
             original_points = group_points[frame_id]
-            valid_markers = np.all(np.isfinite(original_points), axis=1)
-            if fill_missing:
-                valid_markers = valid_markers | np.all(np.isfinite(rigid_points), axis=1)
-            if not np.any(valid_markers):
-                continue
-
-            corrected_points = original_points.copy()
-            finite_markers = valid_markers & np.all(np.isfinite(original_points), axis=1)
-            corrected_points[finite_markers] = (
-                (1.0 - blend) * original_points[finite_markers]
-                + blend * rigid_points[finite_markers]
-            )
-            if fill_missing:
-                missing_markers = ~np.all(np.isfinite(original_points), axis=1) & np.all(np.isfinite(rigid_points), axis=1)
-                corrected_points[missing_markers] = rigid_points[missing_markers]
-
-            if np.any(finite_markers):
-                deltas_mm.extend(
-                    np.linalg.norm(corrected_points[finite_markers] - original_points[finite_markers], axis=1)
-                    * 1000.0
-                )
-            Q_stabilized.iloc[frame_id, columns] = corrected_points.reshape(-1)
             accepted_frames += 1
+            corrected_points, guard_stats = _guarded_3d_rigid_points(
+                config_dict,
+                template,
+                original_points,
+                rigid_points,
+            )
+            if guard_stats['correction_limited']:
+                correction_limited_frames += 1
+            if guard_stats['pairwise_guarded']:
+                pairwise_guarded_frames += 1
+            if guard_stats['pairwise_rejected']:
+                pairwise_rejected_frames += 1
+            corrected_points, step_limited = _limit_3d_rigid_correction_step(
+                config_dict,
+                original_points,
+                corrected_points,
+                previous_original_points,
+                previous_corrected_points,
+            )
+            if step_limited:
+                step_limited_frames += 1
+                guard_stats['step_limited'] = True
+                guard_stats = _update_3d_guard_delta_stats(guard_stats, original_points, corrected_points)
+            deltas_mm.extend(guard_stats['delta_mm'])
+            if guard_stats['applied']:
+                Q_stabilized.iloc[frame_id, columns] = corrected_points.reshape(-1)
+                applied_frames += 1
+            previous_original_points = original_points
+            previous_corrected_points = corrected_points
+
+        repaired_points, spike_repaired_frames = _repair_3d_rigid_pairwise_spikes(
+            config_dict,
+            _extract_marker_points(Q_stabilized, marker_indices),
+        )
+        if spike_repaired_frames:
+            Q_stabilized.iloc[:, columns] = repaired_points.reshape(len(Q_stabilized), -1)
 
         mean_delta_mm = float(np.mean(deltas_mm)) if deltas_mm else np.nan
+        max_delta_mm = float(np.max(deltas_mm)) if deltas_mm else np.nan
         stats.append({
             'name': group_name,
             'accepted': accepted_frames,
+            'applied': applied_frames,
             'total': len(Q_coords),
             'mean_delta_mm': mean_delta_mm,
+            'max_delta_mm': max_delta_mm,
+            'correction_limited': correction_limited_frames,
+            'pairwise_guarded': pairwise_guarded_frames,
+            'pairwise_rejected': pairwise_rejected_frames,
+            'step_limited': step_limited_frames,
+            'spike_repaired': spike_repaired_frames,
         })
         logging.info(
-            f"3D rigid marker group {group_name}: stabilized {accepted_frames}/{len(Q_coords)} frames"
-            + (f" with mean correction {mean_delta_mm:.1f} mm." if np.isfinite(mean_delta_mm) else ".")
+            f"3D rigid marker group {group_name}: accepted {accepted_frames}/{len(Q_coords)} frames, "
+            f"applied {applied_frames}/{len(Q_coords)} frames"
+            + (f", mean correction {mean_delta_mm:.1f} mm" if np.isfinite(mean_delta_mm) else "")
+            + (f", max correction {max_delta_mm:.1f} mm" if np.isfinite(max_delta_mm) else "")
+            + (f", spike repaired {spike_repaired_frames} marker-frames" if spike_repaired_frames else "")
+            + "."
         )
 
     return Q_stabilized, stats

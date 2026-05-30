@@ -582,6 +582,362 @@ def _draw_pose_predictions(frame, keypoints, scores, pose_model):
     return img_show
 
 
+def _person_bbox_info(person_keypoints, person_scores=None, min_score=0.05):
+    person_keypoints = np.asarray(person_keypoints, dtype=np.float32)
+    valid = np.all(np.isfinite(person_keypoints), axis=1)
+    if person_scores is not None:
+        person_scores = np.asarray(person_scores, dtype=np.float32)
+        if person_scores.shape[0] == person_keypoints.shape[0]:
+            valid &= np.isfinite(person_scores) & (person_scores > min_score)
+
+    if not np.any(valid):
+        return None
+
+    xy = person_keypoints[valid]
+    bbox = np.array([xy[:, 0].min(), xy[:, 1].min(), xy[:, 0].max(), xy[:, 1].max()], dtype=np.float32)
+    center = np.array([(bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0], dtype=np.float32)
+    area = max(0.0, float(bbox[2] - bbox[0])) * max(0.0, float(bbox[3] - bbox[1]))
+    return {'bbox': bbox, 'center': center, 'area': area}
+
+
+class SinglePersonSelector:
+    '''
+    Keep one continuous primary person in single-person projects.
+    '''
+
+    def __init__(self):
+        self.previous_center = None
+
+    def select(self, keypoints, scores):
+        keypoints = np.asarray(keypoints, dtype=np.float32)
+        scores = np.asarray(scores, dtype=np.float32)
+        if keypoints.ndim != 3 or scores.ndim != 2 or keypoints.shape[:2] != scores.shape:
+            return keypoints, scores
+        if keypoints.shape[0] <= 1:
+            if keypoints.shape[0] == 1:
+                info = _person_bbox_info(keypoints[0], scores[0])
+                if info is not None:
+                    self.previous_center = info['center']
+            return keypoints, scores
+
+        candidates = []
+        for person_id in range(keypoints.shape[0]):
+            info = _person_bbox_info(keypoints[person_id], scores[person_id])
+            if info is not None:
+                candidates.append((person_id, info))
+
+        if not candidates:
+            return keypoints[:1], scores[:1]
+
+        if self.previous_center is None:
+            selected_id, selected_info = max(candidates, key=lambda candidate: candidate[1]['area'])
+        else:
+            selected_id, selected_info = min(
+                candidates,
+                key=lambda candidate: float(np.linalg.norm(candidate[1]['center'] - self.previous_center)),
+            )
+
+        self.previous_center = selected_info['center']
+        return keypoints[selected_id:selected_id + 1], scores[selected_id:selected_id + 1]
+
+
+def _smoothing_factor(dt, cutoff):
+    r = 2 * np.pi * cutoff * dt
+    return r / (r + 1)
+
+
+class _OneEuro2DState:
+    def __init__(self):
+        self.value_prev = None
+        self.derivative_prev = np.zeros(2, dtype=np.float64)
+
+    def reset(self):
+        self.value_prev = None
+        self.derivative_prev = np.zeros(2, dtype=np.float64)
+
+    def filter(self, value, dt, min_cutoff, beta, d_cutoff):
+        value = np.asarray(value, dtype=np.float64)
+        if self.value_prev is None or not np.all(np.isfinite(self.value_prev)):
+            self.value_prev = value
+            self.derivative_prev = np.zeros(2, dtype=np.float64)
+            return value.copy()
+
+        dt = max(float(dt), 1e-6)
+        alpha_d = _smoothing_factor(dt, d_cutoff)
+        derivative = (value - self.value_prev) / dt
+        derivative_hat = alpha_d * derivative + (1.0 - alpha_d) * self.derivative_prev
+
+        cutoff = min_cutoff + beta * np.abs(derivative_hat)
+        alpha = _smoothing_factor(dt, cutoff)
+        value_hat = alpha * value + (1.0 - alpha) * self.value_prev
+
+        self.value_prev = value_hat
+        self.derivative_prev = derivative_hat
+        return value_hat.copy()
+
+
+class Pose2DTemporalSmoother:
+    '''
+    Per-video 2D keypoint temporal smoother.
+
+    State is keyed by the post-tracking person slot and keypoint id, so the
+    smoother should be created once per camera/video stream.
+    '''
+
+    def __init__(self, config):
+        self.enabled = bool(config and config.get('enabled', False))
+        self.frame_rate = float(config.get('frame_rate', 30) if config else 30)
+        self.min_cutoff = float(config.get('min_cutoff', 1.0) if config else 1.0)
+        self.beta = float(config.get('beta', 0.02) if config else 0.02)
+        self.d_cutoff = float(config.get('d_cutoff', 1.0) if config else 1.0)
+        self.min_likelihood = float(config.get('min_likelihood', 0.3) if config else 0.3)
+        self.max_gap = int(config.get('max_gap', 5) if config else 5)
+        keypoints = None if not config else config.get('keypoint_ids')
+        self.keypoint_ids = None if keypoints in (None, 'all') else set(int(kpt_id) for kpt_id in keypoints)
+        self.foot_anchor_guard = bool(config.get('foot_anchor_guard', False) if config else False)
+        self.foot_anchor_max_leg_ratio = float(config.get('foot_anchor_max_leg_ratio', 0.8) if config else 0.8)
+        self.foot_anchor_min_px = float(config.get('foot_anchor_min_px', 80.0) if config else 80.0)
+        self.foot_anchor_groups = self._build_foot_anchor_groups(
+            config.get('keypoint_names', {}) if config else {}
+        )
+        self._states = {}
+
+    def _should_smooth_keypoint(self, keypoint_id):
+        return self.keypoint_ids is None or keypoint_id in self.keypoint_ids
+
+    def _state_for(self, person_id, keypoint_id):
+        key = (int(person_id), int(keypoint_id))
+        if key not in self._states:
+            self._states[key] = {'filter': _OneEuro2DState(), 'last_valid_frame': None}
+        return self._states[key]
+
+    @staticmethod
+    def _valid_keypoint(point, score, min_likelihood):
+        return (
+            np.all(np.isfinite(point))
+            and np.isfinite(score)
+            and score >= min_likelihood
+        )
+
+    @staticmethod
+    def _build_foot_anchor_groups(keypoint_names):
+        name_to_id = {
+            str(name).lower(): int(keypoint_id)
+            for keypoint_id, name in dict(keypoint_names).items()
+            if name is not None
+        }
+
+        groups = []
+        for side in ('L', 'R'):
+            foot_ids = [
+                name_to_id.get(f'{side}{name}'.lower())
+                for name in ('BigToe', 'SmallToe', 'Heel')
+            ]
+            foot_ids = [keypoint_id for keypoint_id in foot_ids if keypoint_id is not None]
+            ankle_id = name_to_id.get(f'{side}Ankle'.lower())
+            knee_id = name_to_id.get(f'{side}Knee'.lower())
+            if ankle_id is not None and foot_ids:
+                groups.append({
+                    'ankle': ankle_id,
+                    'knee': knee_id,
+                    'feet': foot_ids,
+                })
+        return groups
+
+    def _apply_foot_anchor_guard(self, keypoints, scores):
+        if (
+            not self.foot_anchor_guard
+            or not self.foot_anchor_groups
+            or self.foot_anchor_max_leg_ratio <= 0
+        ):
+            return []
+
+        zeroed_keypoints = []
+        keypoint_count = keypoints.shape[1]
+        for person_id in range(keypoints.shape[0]):
+            for group in self.foot_anchor_groups:
+                ankle_id = group['ankle']
+                knee_id = group['knee']
+                if ankle_id >= keypoint_count:
+                    continue
+
+                ankle = keypoints[person_id, ankle_id]
+                ankle_score = scores[person_id, ankle_id]
+                if not self._valid_keypoint(ankle, ankle_score, self.min_likelihood):
+                    continue
+
+                max_distance = self.foot_anchor_min_px
+                if knee_id is not None and knee_id < keypoint_count:
+                    knee = keypoints[person_id, knee_id]
+                    knee_score = scores[person_id, knee_id]
+                    if self._valid_keypoint(knee, knee_score, self.min_likelihood):
+                        leg_length = float(np.linalg.norm(ankle - knee))
+                        if np.isfinite(leg_length) and leg_length > 0:
+                            max_distance = max(
+                                max_distance,
+                                self.foot_anchor_max_leg_ratio * leg_length,
+                            )
+
+                for foot_id in group['feet']:
+                    if foot_id >= keypoint_count:
+                        continue
+                    foot = keypoints[person_id, foot_id]
+                    foot_score = scores[person_id, foot_id]
+                    if not self._valid_keypoint(foot, foot_score, self.min_likelihood):
+                        continue
+                    if float(np.linalg.norm(foot - ankle)) > max_distance:
+                        keypoints[person_id, foot_id] = np.zeros(2, dtype=np.float32)
+                        scores[person_id, foot_id] = 0.0
+                        zeroed_keypoints.append((person_id, foot_id))
+        return zeroed_keypoints
+
+    def smooth(self, keypoints, scores, frame_idx):
+        if not self.enabled:
+            return keypoints, scores
+
+        keypoints = np.asarray(keypoints, dtype=np.float32)
+        scores = np.asarray(scores, dtype=np.float32)
+        if keypoints.ndim != 3 or scores.ndim != 2 or keypoints.shape[:2] != scores.shape:
+            return keypoints, scores
+        if keypoints.size == 0:
+            return keypoints, scores
+
+        keypoints = keypoints.copy()
+        scores = scores.copy()
+        self._apply_foot_anchor_guard(keypoints, scores)
+
+        smoothed = keypoints.copy()
+        frame_idx = int(frame_idx)
+        default_dt = 1.0 / self.frame_rate if self.frame_rate > 0 else 1.0 / 30.0
+
+        for person_id in range(keypoints.shape[0]):
+            for keypoint_id in range(keypoints.shape[1]):
+                if not self._should_smooth_keypoint(keypoint_id):
+                    continue
+
+                point = keypoints[person_id, keypoint_id]
+                score = scores[person_id, keypoint_id]
+                state = self._state_for(person_id, keypoint_id)
+                valid = self._valid_keypoint(point, score, self.min_likelihood)
+                if not valid:
+                    last_valid_frame = state['last_valid_frame']
+                    if last_valid_frame is None or frame_idx - last_valid_frame > self.max_gap:
+                        state['filter'].reset()
+                    # Zero out low-confidence detections so downstream
+                    # triangulation treats them as missing rather than
+                    # accepting noisy coordinates.
+                    smoothed[person_id, keypoint_id] = np.zeros(2, dtype=np.float32)
+                    scores[person_id, keypoint_id] = 0.0
+                    continue
+
+                last_valid_frame = state['last_valid_frame']
+                if last_valid_frame is None or frame_idx - last_valid_frame > self.max_gap:
+                    state['filter'].reset()
+                    dt = default_dt
+                else:
+                    dt = max((frame_idx - last_valid_frame) / self.frame_rate, default_dt) if self.frame_rate > 0 else default_dt
+
+                smoothed[person_id, keypoint_id] = state['filter'].filter(
+                    point,
+                    dt,
+                    self.min_cutoff,
+                    self.beta,
+                    self.d_cutoff,
+                )
+                state['last_valid_frame'] = frame_idx
+
+        for person_id, keypoint_id in self._apply_foot_anchor_guard(smoothed, scores):
+            state = self._state_for(person_id, keypoint_id)
+            state['filter'].reset()
+            state['last_valid_frame'] = None
+
+        return smoothed, scores
+
+
+def _pose_keypoint_name_by_id(pose_model):
+    keypoint_names = {}
+    for _, _, node in RenderTree(pose_model):
+        if node.id is not None:
+            keypoint_names[int(node.id)] = node.name
+    return keypoint_names
+
+
+def _parse_temporal_smoothing_keypoints(raw_keypoints, pose_model):
+    if raw_keypoints in (None, 'all', ['all']):
+        return None
+    if isinstance(raw_keypoints, str):
+        raw_keypoints = [item.strip() for item in raw_keypoints.split(',') if item.strip()]
+    if not isinstance(raw_keypoints, (list, tuple, set)):
+        logging.warning('pose.temporal_smoothing_keypoints must be "all" or a list of keypoint names/ids. Using all keypoints.')
+        return None
+
+    keypoint_names = _pose_keypoint_name_by_id(pose_model)
+    name_to_id = {name.lower(): keypoint_id for keypoint_id, name in keypoint_names.items()}
+    selected_ids = []
+    missing = []
+    for item in raw_keypoints:
+        if isinstance(item, numbers.Integral):
+            selected_ids.append(int(item))
+            continue
+        item_str = str(item).strip()
+        if item_str == '':
+            continue
+        try:
+            selected_ids.append(int(item_str))
+            continue
+        except ValueError:
+            pass
+        keypoint_id = name_to_id.get(item_str.lower())
+        if keypoint_id is None:
+            missing.append(item_str)
+        else:
+            selected_ids.append(keypoint_id)
+
+    if missing:
+        logging.warning(f'pose.temporal_smoothing_keypoints skipped unknown keypoints: {missing}.')
+    if not selected_ids:
+        logging.warning('pose.temporal_smoothing_keypoints did not match any keypoints. Using all keypoints.')
+        return None
+    return sorted(set(selected_ids))
+
+
+def pose_temporal_smoothing_config(config_dict, pose_model, frame_rate):
+    pose_config = config_dict.get('pose', {})
+    if not pose_config.get('temporal_smoothing', False):
+        return {'enabled': False}
+
+    method = str(pose_config.get('temporal_smoothing_method', 'one_euro')).lower()
+    if method != 'one_euro':
+        logging.warning(f'Unsupported pose.temporal_smoothing_method "{method}". Using "one_euro".')
+
+    return {
+        'enabled': True,
+        'method': 'one_euro',
+        'frame_rate': float(frame_rate),
+        'min_cutoff': float(pose_config.get('temporal_smoothing_min_cutoff', 1.0)),
+        'beta': float(pose_config.get('temporal_smoothing_beta', 0.02)),
+        'd_cutoff': float(pose_config.get('temporal_smoothing_d_cutoff', 1.0)),
+        'min_likelihood': float(pose_config.get('temporal_smoothing_min_likelihood', 0.3)),
+        'max_gap': int(pose_config.get('temporal_smoothing_max_gap', 5)),
+        'keypoint_ids': _parse_temporal_smoothing_keypoints(
+            pose_config.get('temporal_smoothing_keypoints', 'all'),
+            pose_model,
+        ),
+        'keypoint_names': _pose_keypoint_name_by_id(pose_model),
+        'foot_anchor_guard': bool(pose_config.get('temporal_smoothing_foot_anchor_guard', False)),
+        'foot_anchor_max_leg_ratio': float(
+            pose_config.get('temporal_smoothing_foot_anchor_max_leg_ratio', 0.8)
+        ),
+        'foot_anchor_min_px': float(pose_config.get('temporal_smoothing_foot_anchor_min_px', 80.0)),
+    }
+
+
+def _make_pose_temporal_smoother(temporal_smoothing_config):
+    if not temporal_smoothing_config or not temporal_smoothing_config.get('enabled', False):
+        return None
+    return Pose2DTemporalSmoother(temporal_smoothing_config)
+
+
 def save_to_openpose(json_file_path, keypoints, scores):
     '''
     Save the keypoints and scores to a JSON file in the OpenPose format
@@ -625,7 +981,10 @@ def save_to_openpose(json_file_path, keypoints, scores):
         json.dump(json_output, json_file)
 
 
-def process_video(video_path, pose_tracker, pose_model, frame_range, average_likelihood_threshold_pose, output_format, save_video, save_images, display_detection, tracking_mode, max_distance_px, deepsort_tracker, cancel_event=None):
+def process_video(video_path, pose_tracker, pose_model, frame_range, average_likelihood_threshold_pose,
+                  output_format, save_video, save_images, display_detection, tracking_mode,
+                  max_distance_px, deepsort_tracker, multi_person=False,
+                  temporal_smoothing_config=None, cancel_event=None):
     '''
     Estimate pose from a video file
     
@@ -685,6 +1044,8 @@ def process_video(video_path, pose_tracker, pose_model, frame_range, average_lik
     # Retrieve keypoint names from model
     keypoints_ids = [node.id for _, _, node in RenderTree(pose_model) if node.id!=None]
     kpt_id_max = max(keypoints_ids)+1
+    single_person_selector = None if multi_person else SinglePersonSelector()
+    temporal_smoother = _make_pose_temporal_smoother(temporal_smoothing_config)
 
     with tqdm(iterable=range(*f_range), desc=f'Processing {os.path.basename(video_path)}') as pbar:
         while cap.isOpened():
@@ -716,6 +1077,12 @@ def process_video(video_path, pose_tracker, pose_model, frame_range, average_lik
                 except:
                     keypoints = np.full((1,kpt_id_max,2), fill_value=np.nan)
                     scores = np.full((1,kpt_id_max), fill_value=np.nan)
+
+                if single_person_selector is not None:
+                    keypoints, scores = single_person_selector.select(keypoints, scores)
+
+                if temporal_smoother is not None:
+                    keypoints, scores = temporal_smoother.smooth(keypoints, scores, frame_idx)
                     
                 # Save to json
                 if 'openpose' in output_format:
@@ -756,7 +1123,8 @@ def process_video(video_path, pose_tracker, pose_model, frame_range, average_lik
 
 def process_video_batched(video_path, pose_tracker, pose_model, frame_range, average_likelihood_threshold_pose,
                           output_format, save_video, save_images, display_detection, tracking_mode,
-                          max_distance_px, deepsort_tracker, batch_size, cancel_event=None):
+                          max_distance_px, deepsort_tracker, batch_size, multi_person=False,
+                          temporal_smoothing_config=None, cancel_event=None):
     '''
     Estimate pose from a video file with batched GPU inference.
     '''
@@ -770,7 +1138,8 @@ def process_video_batched(video_path, pose_tracker, pose_model, frame_range, ave
         return process_video(
             video_path, pose_tracker, pose_model, frame_range, average_likelihood_threshold_pose,
             output_format, save_video, save_images, display_detection, tracking_mode,
-            max_distance_px, deepsort_tracker, cancel_event=cancel_event,
+            max_distance_px, deepsort_tracker, multi_person=multi_person,
+            temporal_smoothing_config=temporal_smoothing_config, cancel_event=cancel_event,
         )
 
     cap = cv2.VideoCapture(video_path)
@@ -807,6 +1176,8 @@ def process_video_batched(video_path, pose_tracker, pose_model, frame_range, ave
     keypoints_ids = [node.id for _, _, node in RenderTree(pose_model) if node.id != None]
     kpt_id_max = max(keypoints_ids) + 1
     stop_requested = False
+    single_person_selector = None if multi_person else SinglePersonSelector()
+    temporal_smoother = _make_pose_temporal_smoother(temporal_smoothing_config)
 
     if pose_tracker.det_frequency > 1:
         logging.info(
@@ -875,6 +1246,12 @@ def process_video_batched(video_path, pose_tracker, pose_model, frame_range, ave
                 except Exception:
                     keypoints, scores = _empty_pose_arrays(kpt_id_max)
 
+                if single_person_selector is not None:
+                    keypoints, scores = single_person_selector.select(keypoints, scores)
+
+                if temporal_smoother is not None:
+                    keypoints, scores = temporal_smoother.smooth(keypoints, scores, current_frame_idx)
+
                 if 'openpose' in output_format:
                     json_file_path = os.path.join(json_output_dir, f'{video_name_wo_ext}_{current_frame_idx:06d}.json')
                     save_to_openpose(json_file_path, keypoints, scores)
@@ -913,7 +1290,8 @@ def process_video_batched(video_path, pose_tracker, pose_model, frame_range, ave
 def process_video_worker(video_path, ModelClass, det_frequency, mode, backend, device,
                          pose_model, frame_range, average_likelihood_threshold_pose,
                          output_format, save_video, save_images, display_detection, tracking_mode,
-                         max_distance_px, deepsort_params, multi_person, batch_size, init_lock, cancel_event):
+                         max_distance_px, deepsort_params, multi_person, batch_size,
+                         temporal_smoothing_config, init_lock, cancel_event):
     '''
     Worker function for parallel pose estimation. Creates its own PoseTracker
     and optional DeepSort tracker, then processes one video independently.
@@ -931,17 +1309,23 @@ def process_video_worker(video_path, ModelClass, det_frequency, mode, backend, d
         process_video_batched(
             video_path, pose_tracker, pose_model, frame_range, average_likelihood_threshold_pose,
             output_format, save_video, save_images, display_detection,
-            tracking_mode, max_distance_px, deepsort_tracker, batch_size, cancel_event=cancel_event,
+            tracking_mode, max_distance_px, deepsort_tracker, batch_size,
+            multi_person=multi_person, temporal_smoothing_config=temporal_smoothing_config,
+            cancel_event=cancel_event,
         )
     else:
         process_video(
             video_path, pose_tracker, pose_model, frame_range, average_likelihood_threshold_pose,
             output_format, save_video, save_images, display_detection,
-            tracking_mode, max_distance_px, deepsort_tracker, cancel_event=cancel_event,
+            tracking_mode, max_distance_px, deepsort_tracker,
+            multi_person=multi_person, temporal_smoothing_config=temporal_smoothing_config,
+            cancel_event=cancel_event,
         )
 
 
-def process_images(image_folder_path, pose_tracker, pose_model, output_format, fps, save_video, save_images, display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker):
+def process_images(image_folder_path, pose_tracker, pose_model, output_format, fps, save_video, save_images,
+                   display_detection, frame_range, tracking_mode, max_distance_px, deepsort_tracker,
+                   multi_person=False, temporal_smoothing_config=None):
     '''
     Estimate pose estimation from a folder of images
     
@@ -991,6 +1375,8 @@ def process_images(image_folder_path, pose_tracker, pose_model, output_format, f
     # Retrieve keypoint names from model
     keypoints_ids = [node.id for _, _, node in RenderTree(pose_model) if node.id!=None]
     kpt_id_max = max(keypoints_ids)+1
+    single_person_selector = None if multi_person else SinglePersonSelector()
+    temporal_smoother = _make_pose_temporal_smoother(temporal_smoothing_config)
     
     f_range = [[0,len(image_files)] if frame_range in ('all', 'auto', []) else frame_range][0]
     for frame_idx, image_file in enumerate(tqdm(image_files, desc=f'\nProcessing {os.path.basename(img_output_dir)}')):
@@ -1014,6 +1400,12 @@ def process_images(image_folder_path, pose_tracker, pose_model, output_format, f
             except:
                 keypoints = np.full((1,kpt_id_max,2), fill_value=np.nan)
                 scores = np.full((1,kpt_id_max), fill_value=np.nan)
+
+            if single_person_selector is not None:
+                keypoints, scores = single_person_selector.select(keypoints, scores)
+
+            if temporal_smoother is not None:
+                keypoints, scores = temporal_smoother.smooth(keypoints, scores, frame_idx)
 
             # Extract frame number from the filename
             if 'openpose' in output_format:
@@ -1143,6 +1535,7 @@ def estimate_pose_all(config_dict):
     logging.info('Estimating pose...\n')
     pose_model_name = pose_model
     pose_model, ModelClass, mode = setup_model_class_mode(pose_model, mode, config_dict)
+    temporal_smoothing_config = pose_temporal_smoothing_config(config_dict, pose_model, frame_rate)
 
     # Estimate pose
     try:
@@ -1171,6 +1564,15 @@ def estimate_pose_all(config_dict):
             raise ValueError(f"Invalid batch_size: {batch_size}. Must be an integer greater or equal to 1.")
         if batch_size > 1:
             logging.info(f'GPU pose batching requested with batch_size={batch_size}.')
+        if temporal_smoothing_config.get('enabled', False):
+            logging.info(
+                '2D temporal smoothing enabled: OneEuro '
+                f"min_cutoff={temporal_smoothing_config['min_cutoff']}, "
+                f"beta={temporal_smoothing_config['beta']}, "
+                f"d_cutoff={temporal_smoothing_config['d_cutoff']}, "
+                f"min_likelihood={temporal_smoothing_config['min_likelihood']}, "
+                f"foot_anchor_guard={temporal_smoothing_config.get('foot_anchor_guard', False)}."
+            )
         
         # Select device and backend
         backend, device = setup_backend_device(backend=backend, device=device)
@@ -1202,6 +1604,8 @@ def estimate_pose_all(config_dict):
             logging.warning(f"Tracking mode {tracking_mode} not recognized. Using sports2d method.")
             tracking_mode = 'sports2d'
         logging.info(f'Tracking is performed with {tracking_mode}{"" if not tracking_mode=="deepsort" else f" with parameters: {deepsort_params}"}.\n')
+        if not multi_person:
+            logging.info('Single-person mode: keeping one primary person per frame in pose JSON and visualizations.')
 
         if not len(video_files) == 0:
             # Process video files
@@ -1219,7 +1623,8 @@ def estimate_pose_all(config_dict):
                             ModelClass, det_frequency, mode, backend, device,
                             pose_model, frame_range, average_likelihood_threshold_pose,
                             output_format, save_video, save_images, display_detection, tracking_mode,
-                            max_distance_px, deepsort_params, multi_person, batch_size, init_lock, cancel_event
+                            max_distance_px, deepsort_params, multi_person, batch_size,
+                            temporal_smoothing_config, init_lock, cancel_event
                         ): video_path for video_path in video_files
                     }
                     try:
@@ -1259,12 +1664,14 @@ def estimate_pose_all(config_dict):
                             video_path, pose_tracker, pose_model, frame_range, average_likelihood_threshold_pose,
                             output_format, save_video, save_images, display_detection, tracking_mode,
                             max_distance_px, deepsort_tracker, batch_size,
+                            multi_person=multi_person, temporal_smoothing_config=temporal_smoothing_config,
                         )
                     else:
                         process_video(
                             video_path, pose_tracker, pose_model, frame_range, average_likelihood_threshold_pose,
                             output_format, save_video, save_images, display_detection, tracking_mode,
                             max_distance_px, deepsort_tracker,
+                            multi_person=multi_person, temporal_smoothing_config=temporal_smoothing_config,
                         )
 
         else:

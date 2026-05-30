@@ -46,6 +46,7 @@ import numpy as np
 np.set_printoptions(legacy='1.21') # otherwise prints np.float64(3.0) rather than 3.0
 import json
 import itertools as it
+import time
 import pandas as pd
 import cv2
 import toml
@@ -166,6 +167,76 @@ def indices_of_first_last_non_nan_chunks(series, min_chunk_size=10, chunk_choice
     
     # Return the trimmed series
     return first_run_start, last_run_end
+
+
+def _normalize_large_gap_fill_mode(mode, default='nan'):
+    mode = str(mode or default).lower()
+    if mode in ('last_value', 'nan', 'zeros'):
+        return mode
+    logging.warning(
+        'Invalid large-gap fill mode "%s". Falling back to "%s".',
+        mode,
+        default,
+    )
+    return default
+
+
+def _large_gap_marker_fill_overrides(config_dict, keypoints_names):
+    raw_overrides = config_dict.get('triangulation', {}).get(
+        'fill_large_gaps_marker_overrides',
+        {},
+    )
+    if raw_overrides in (None, ''):
+        return {}
+    if not isinstance(raw_overrides, dict):
+        logging.warning(
+            'triangulation.fill_large_gaps_marker_overrides must be a marker-to-mode table; ignoring it.'
+        )
+        return {}
+
+    overrides = {}
+    for marker_name, fill_mode in raw_overrides.items():
+        if marker_name not in keypoints_names:
+            logging.warning(
+                'Ignoring large-gap fill override for unknown marker "%s".',
+                marker_name,
+            )
+            continue
+        overrides[keypoints_names.index(marker_name)] = _normalize_large_gap_fill_mode(fill_mode)
+    return overrides
+
+
+def _apply_large_gap_fill(Q, zero_nan_frames_per_kpt, keypoints_names, fill_large_gaps_with, marker_fill_overrides):
+    fill_large_gaps_with = _normalize_large_gap_fill_mode(fill_large_gaps_with)
+
+    if fill_large_gaps_with == 'last_value':
+        Q_filled = Q.ffill(axis=0)
+        Q_filled.replace([np.inf, -np.inf], np.nan, inplace=True)
+    elif fill_large_gaps_with == 'zeros':
+        Q_filled = Q.copy()
+        Q_filled.replace([np.nan, np.inf, -np.inf], 0, inplace=True)
+    else:
+        Q_filled = Q.copy()
+        Q_filled.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    for keypoint_id, fill_mode in marker_fill_overrides.items():
+        if keypoint_id >= len(keypoints_names) or fill_mode == fill_large_gaps_with:
+            continue
+
+        missing_positions = zero_nan_frames_per_kpt[keypoint_id]
+        if len(missing_positions) == 0:
+            continue
+
+        column_positions = slice(keypoint_id * 3, keypoint_id * 3 + 3)
+        if fill_mode == 'last_value':
+            Q_filled.iloc[:, column_positions] = Q.iloc[:, column_positions].ffill(axis=0)
+        elif fill_mode == 'zeros':
+            Q_filled.iloc[missing_positions, column_positions] = 0
+        else:
+            Q_filled.iloc[missing_positions, column_positions] = np.nan
+
+    Q_filled.replace([np.inf, -np.inf], np.nan, inplace=True)
+    return Q_filled
 
 
 def make_trc(config_dict, Q, keypoints_names, id_person=-1):
@@ -676,13 +747,36 @@ def parse_rigid_marker_groups(config_dict, keypoints_names):
         if group_key in seen_groups:
             continue
         seen_groups.add(group_key)
+
+        # Collect any per-group overrides (everything that is not the name or
+        # marker list). Short keys such as ``fill_missing`` are normalized to the
+        # ``rigid_group_*`` names the helpers look up, so a group can locally tune
+        # behaviour without touching the global defaults used by other groups.
+        options = {}
+        if isinstance(raw_group, dict):
+            reserved = {'name', 'markers', 'names', 'keypoints'}
+            for key, value in raw_group.items():
+                if key in reserved:
+                    continue
+                opt_key = key if key.startswith('rigid_group_') else f'rigid_group_{key}'
+                options[opt_key] = value
+
         groups.append({
             'name': group_name or '+'.join(present_markers),
             'markers': present_markers,
             'indices': indices,
+            'options': options,
         })
 
     return groups
+
+
+def _rigid_param(group_options, triangulation_config, key, default):
+    '''Resolve a rigid-group parameter: per-group override first, then the
+    global triangulation config, then the supplied default.'''
+    if group_options is not None and key in group_options:
+        return group_options[key]
+    return triangulation_config.get(key, default)
 
 
 def _rigid_group_columns(keypoint_indices):
@@ -694,11 +788,11 @@ def _extract_group_points(Q_df, keypoint_indices):
     return Q_df.iloc[:, columns].to_numpy(dtype=float).reshape(len(Q_df), len(keypoint_indices), 3)
 
 
-def _build_rigid_template(group_points, group_name, config_dict):
+def _build_rigid_template(group_points, group_name, config_dict, group_options=None):
     triangulation_config = config_dict.get('triangulation', {})
-    min_template_frames = triangulation_config.get('rigid_group_template_min_frames', 20)
-    mad_factor = triangulation_config.get('rigid_group_template_mad_factor', 5.0)
-    distance_floor_m = triangulation_config.get('rigid_group_template_distance_floor_m', 0.02)
+    min_template_frames = _rigid_param(group_options, triangulation_config, 'rigid_group_template_min_frames', 20)
+    mad_factor = _rigid_param(group_options, triangulation_config, 'rigid_group_template_mad_factor', 5.0)
+    distance_floor_m = _rigid_param(group_options, triangulation_config, 'rigid_group_template_distance_floor_m', 0.02)
 
     complete_frames = np.all(np.isfinite(group_points), axis=(1, 2))
     if np.count_nonzero(complete_frames) < 3:
@@ -823,17 +917,26 @@ def _rigid_reprojection_error(points, x_obs, y_obs, likelihood_obs, projection_m
     ])
 
 
-def _fit_rigid_group_frame(config_dict, template, baseline_points, x_obs, y_obs, likelihood_obs, projection_matrices):
+def _fit_rigid_group_frame(config_dict, template, baseline_points, x_obs, y_obs, likelihood_obs, projection_matrices, group_options=None):
     triangulation_config = config_dict.get('triangulation', {})
-    error_threshold = triangulation_config.get(
-        'rigid_group_reproj_error_threshold',
+    error_threshold = _rigid_param(
+        group_options, triangulation_config, 'rigid_group_reproj_error_threshold',
         triangulation_config.get('reproj_error_threshold_triangulation', 15),
     )
     min_cameras = triangulation_config.get('min_cameras_for_triangulation', 2)
-    min_markers = triangulation_config.get('rigid_group_min_markers', 3)
-    max_nfev = triangulation_config.get('rigid_group_max_nfev', 80)
-    loss = triangulation_config.get('rigid_group_loss', 'soft_l1')
-    loss_scale = triangulation_config.get('rigid_group_loss_scale_px', 5.0)
+    min_markers = _rigid_param(group_options, triangulation_config, 'rigid_group_min_markers', 3)
+    max_nfev = _rigid_param(group_options, triangulation_config, 'rigid_group_max_nfev', 30)
+    loss = _rigid_param(group_options, triangulation_config, 'rigid_group_loss', 'soft_l1')
+    loss_scale = _rigid_param(group_options, triangulation_config, 'rigid_group_loss_scale_px', 5.0)
+    max_cams_to_exclude = _rigid_param(group_options, triangulation_config, 'rigid_group_max_cams_to_exclude', 1)
+    if max_nfev in (None, False):
+        max_nfev = None
+    else:
+        max_nfev = int(max_nfev)
+    if max_cams_to_exclude in (None, False):
+        max_cams_to_exclude = 0
+    else:
+        max_cams_to_exclude = int(max_cams_to_exclude)
 
     valid_observations = (
         np.isfinite(x_obs)
@@ -849,17 +952,36 @@ def _fit_rigid_group_frame(config_dict, template, baseline_points, x_obs, y_obs,
 
     initial_params = _initial_rigid_params(template, baseline_points)
     best_fit = None
-    max_cams_to_exclude = n_cams - min_cameras
+    valid_camera_ids = [cam_id for cam_id in range(n_cams) if valid_observations[cam_id].any()]
+    max_cams_to_exclude = min(max(0, max_cams_to_exclude), len(valid_camera_ids) - min_cameras)
     for nb_cams_off in range(max_cams_to_exclude + 1):
-        for excluded_cams in it.combinations(range(n_cams), nb_cams_off):
-            camera_ids = [cam_id for cam_id in range(n_cams) if cam_id not in excluded_cams]
-            used_camera_ids = [cam_id for cam_id in camera_ids if valid_observations[cam_id].any()]
+        for excluded_cams in it.combinations(valid_camera_ids, nb_cams_off):
+            used_camera_ids = [cam_id for cam_id in valid_camera_ids if cam_id not in excluded_cams]
             if len(used_camera_ids) < min_cameras:
                 continue
             if np.count_nonzero(valid_observations[used_camera_ids].any(axis=0)) < min_markers:
                 continue
             if np.count_nonzero(valid_observations[used_camera_ids]) * 2 < 6:
                 continue
+
+            initial_points = _rigid_points_from_params(initial_params, template)
+            initial_error, initial_marker_errors = _rigid_reprojection_error(
+                initial_points, x_obs, y_obs, likelihood_obs, projection_matrices, used_camera_ids
+            )
+            if np.isfinite(initial_error):
+                deliberately_excluded = set(range(n_cams)) - set(used_camera_ids)
+                candidate = {
+                    'points': initial_points,
+                    'params': initial_params,
+                    'error': initial_error,
+                    'marker_errors': initial_marker_errors,
+                    'excluded_cams': sorted(deliberately_excluded),
+                    'used_cams': used_camera_ids,
+                }
+                if best_fit is None or candidate['error'] < best_fit['error']:
+                    best_fit = candidate
+                if initial_error <= error_threshold:
+                    return candidate
 
             result = least_squares(
                 _rigid_group_residuals,
@@ -897,10 +1019,12 @@ def _fit_rigid_group_frame(config_dict, template, baseline_points, x_obs, y_obs,
     return best_fit
 
 
-def _smooth_rigid_params(fits, config_dict):
-    window = config_dict.get('triangulation', {}).get('rigid_group_smoothing_window', 5)
+def _smooth_rigid_params(fits, config_dict, group_options=None):
+    triangulation_config = config_dict.get('triangulation', {})
+    window = _rigid_param(group_options, triangulation_config, 'rigid_group_smoothing_window', 5)
     if window in (None, False) or window <= 1:
         return [fit.get('params') if fit is not None else None for fit in fits]
+    method = str(_rigid_param(group_options, triangulation_config, 'rigid_group_smoothing_method', 'median')).lower()
 
     params = np.full((len(fits), 6), np.nan)
     for frame_id, fit in enumerate(fits):
@@ -910,11 +1034,18 @@ def _smooth_rigid_params(fits, config_dict):
         return [fit.get('params') if fit is not None else None for fit in fits]
 
     params_df = pd.DataFrame(params)
-    smoothed = params_df.rolling(
-        window=int(window),
-        center=True,
-        min_periods=1,
-    ).median().to_numpy()
+    roll = params_df.rolling(window=int(window), center=True, min_periods=1)
+    # 'median' (default) rejects outlier single-frame fits but is edge-preserving,
+    # so it leaves depth-ambiguity steps at gap boundaries untouched. 'mean' (and
+    # 'median_then_mean') distribute such steps into a gentle ramp — appropriate for
+    # slow-moving groups like the pelvis where genuine motion has no sharp edges.
+    if method == 'mean':
+        smoothed = roll.mean().to_numpy()
+    elif method in ('median_then_mean', 'median_mean'):
+        median_df = roll.median()
+        smoothed = median_df.rolling(window=int(window), center=True, min_periods=1).mean().to_numpy()
+    else:
+        smoothed = roll.median().to_numpy()
     return [
         smoothed[frame_id] if fit is not None and np.all(np.isfinite(smoothed[frame_id])) else (
             fit.get('params') if fit is not None else None
@@ -923,12 +1054,114 @@ def _smooth_rigid_params(fits, config_dict):
     ]
 
 
+def _pairwise_distance_change_ratio(reference_points, candidate_points, valid_markers):
+    ratios = []
+    for marker_i, marker_j in it.combinations(range(len(reference_points)), 2):
+        if not (valid_markers[marker_i] and valid_markers[marker_j]):
+            continue
+        reference_distance = np.linalg.norm(reference_points[marker_i] - reference_points[marker_j])
+        candidate_distance = np.linalg.norm(candidate_points[marker_i] - candidate_points[marker_j])
+        if not np.isfinite(reference_distance) or not np.isfinite(candidate_distance):
+            continue
+        if reference_distance <= 1e-9:
+            if candidate_distance > 1e-9:
+                ratios.append(np.inf)
+            continue
+        ratios.append(abs(candidate_distance - reference_distance) / reference_distance)
+
+    return max(ratios) if ratios else 0.0
+
+
+def _guarded_rigid_points(config_dict, baseline_points, rigid_points, group_options=None):
+    triangulation_config = config_dict.get('triangulation', {})
+    blend = _rigid_param(group_options, triangulation_config, 'rigid_group_blend', 0.7)
+    max_correction_m = _rigid_param(group_options, triangulation_config, 'rigid_group_max_correction_m', 0.05)
+    max_pairwise_change_ratio = _rigid_param(group_options, triangulation_config, 'rigid_group_max_pairwise_change_ratio', 0.15)
+    fill_missing = bool(_rigid_param(group_options, triangulation_config, 'rigid_group_fill_missing', False))
+
+    blend = 0.7 if blend is None else float(blend)
+    blend = float(np.clip(blend, 0.0, 1.0))
+    if max_correction_m in (None, False):
+        max_correction_m = None
+    else:
+        max_correction_m = float(max_correction_m)
+    if max_pairwise_change_ratio in (None, False):
+        max_pairwise_change_ratio = None
+    else:
+        max_pairwise_change_ratio = float(max_pairwise_change_ratio)
+
+    finite_baseline = np.all(np.isfinite(baseline_points), axis=1)
+    finite_rigid = np.all(np.isfinite(rigid_points), axis=1)
+    blended_markers = finite_baseline & finite_rigid
+    filled_markers = (~finite_baseline) & finite_rigid if fill_missing else np.zeros_like(finite_rigid, dtype=bool)
+
+    stats = {
+        'applied': False,
+        'effective_blend': blend,
+        'correction_limited': False,
+        'pairwise_guarded': False,
+        'pairwise_rejected': False,
+        'delta_mm': [],
+    }
+    if not np.any(blended_markers) and not np.any(filled_markers):
+        return baseline_points, stats
+
+    if max_correction_m is not None and max_correction_m >= 0 and np.any(blended_markers):
+        correction_norms = np.linalg.norm(rigid_points[blended_markers] - baseline_points[blended_markers], axis=1)
+        max_full_correction = np.nanmax(correction_norms) if len(correction_norms) else 0.0
+        if np.isfinite(max_full_correction) and max_full_correction > 0 and blend * max_full_correction > max_correction_m:
+            blend = max_correction_m / max_full_correction
+            stats['correction_limited'] = True
+
+    def build_candidate(candidate_blend):
+        candidate_points = baseline_points.copy()
+        if np.any(blended_markers):
+            candidate_points[blended_markers] = (
+                (1.0 - candidate_blend) * baseline_points[blended_markers]
+                + candidate_blend * rigid_points[blended_markers]
+            )
+        if np.any(filled_markers):
+            candidate_points[filled_markers] = rigid_points[filled_markers]
+        return candidate_points
+
+    corrected_points = build_candidate(blend)
+    if max_pairwise_change_ratio is not None and max_pairwise_change_ratio >= 0:
+        ratio = _pairwise_distance_change_ratio(baseline_points, corrected_points, blended_markers)
+        if ratio > max_pairwise_change_ratio:
+            stats['pairwise_guarded'] = True
+            low_blend, high_blend = 0.0, blend
+            for _ in range(24):
+                mid_blend = (low_blend + high_blend) / 2.0
+                mid_points = build_candidate(mid_blend)
+                mid_ratio = _pairwise_distance_change_ratio(baseline_points, mid_points, blended_markers)
+                if mid_ratio <= max_pairwise_change_ratio:
+                    low_blend = mid_blend
+                else:
+                    high_blend = mid_blend
+            blend = low_blend
+            corrected_points = build_candidate(blend)
+            if blend <= 1e-6 and not np.any(filled_markers):
+                stats['pairwise_rejected'] = True
+
+    stats['effective_blend'] = blend
+    finite_corrected = np.all(np.isfinite(corrected_points), axis=1)
+    changed_markers = finite_baseline & finite_corrected
+    if np.any(changed_markers):
+        deltas_mm = np.linalg.norm(corrected_points[changed_markers] - baseline_points[changed_markers], axis=1) * 1000.0
+        stats['delta_mm'] = [float(delta) for delta in deltas_mm if np.isfinite(delta)]
+    stats['applied'] = (
+        (np.any(changed_markers) and np.nanmax(np.linalg.norm(corrected_points[changed_markers] - baseline_points[changed_markers], axis=1)) > 0)
+        or np.any(filled_markers)
+    )
+    return corrected_points, stats
+
+
 def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df, id_excluded_cams_df,
                                observations, projection_matrices, rigid_groups, id_person=0):
     '''
-    Replace independently triangulated marker coordinates by a rigid transform
-    fit for configured marker groups. Falls back frame-by-frame when the joint
-    reprojection fit does not meet the configured threshold.
+    Stabilize configured marker groups by fitting a rigid transform to 2D
+    observations, then blend the rigid result back into the independent 3D
+    triangulation with proportion guards.
     '''
 
     if not rigid_groups or observations is None:
@@ -948,12 +1181,23 @@ def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df,
 
     stats = []
     for group in rigid_groups:
+        start_time = time.perf_counter()
         group_name = group['name']
         keypoint_indices = group['indices']
+        group_options = group.get('options')
         group_points = _extract_group_points(Q_df, keypoint_indices)
-        template = _build_rigid_template(group_points, group_name, config_dict)
+        template = _build_rigid_template(group_points, group_name, config_dict, group_options)
         if template is None:
-            stats.append({'name': group_name, 'accepted': 0, 'total': len(Q_df), 'mean_error': np.nan})
+            stats.append({
+                'name': group_name,
+                'accepted': 0,
+                'applied': 0,
+                'total': len(Q_df),
+                'mean_error': np.nan,
+                'mean_delta_mm': np.nan,
+                'max_delta_mm': np.nan,
+                'elapsed_seconds': time.perf_counter() - start_time,
+            })
             continue
 
         fits = []
@@ -966,19 +1210,25 @@ def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df,
                 y_obs[row_id][:, keypoint_indices],
                 likelihood_obs[row_id][:, keypoint_indices],
                 projection_matrices,
+                group_options,
             ))
 
         accepted_frames = 0
+        applied_frames = 0
         accepted_errors = []
+        correction_limited_frames = 0
+        pairwise_guarded_frames = 0
+        pairwise_rejected_frames = 0
+        correction_deltas_mm = []
         columns = _rigid_group_columns(keypoint_indices)
-        smoothed_params = _smooth_rigid_params(fits, config_dict)
+        smoothed_params = _smooth_rigid_params(fits, config_dict, group_options)
         for row_id, fit in enumerate(fits):
             if fit is None:
                 continue
 
-            points = _rigid_points_from_params(smoothed_params[row_id], template)
+            rigid_points = _rigid_points_from_params(smoothed_params[row_id], template)
             error, marker_errors = _rigid_reprojection_error(
-                points,
+                rigid_points,
                 x_obs[row_id][:, keypoint_indices],
                 y_obs[row_id][:, keypoint_indices],
                 likelihood_obs[row_id][:, keypoint_indices],
@@ -986,30 +1236,76 @@ def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df,
                 fit['used_cams'],
             )
             if not np.isfinite(error):
-                points = fit['points']
+                rigid_points = fit['points']
                 error = fit['error']
                 marker_errors = fit['marker_errors']
 
-            Q_df.iloc[row_id, columns] = points.reshape(-1)
-            for local_marker_id, keypoint_idx in enumerate(keypoint_indices):
-                marker_error = marker_errors[local_marker_id]
-                error_df.iat[row_id, keypoint_idx] = marker_error if np.isfinite(marker_error) else error
-                nb_cams_excluded_df.iat[row_id, keypoint_idx] = len(fit['excluded_cams'])
-                id_excluded_cams_df.iat[row_id, keypoint_idx] = fit['excluded_cams']
             accepted_frames += 1
+            corrected_points, guard_stats = _guarded_rigid_points(
+                config_dict,
+                group_points[row_id],
+                rigid_points,
+                group_options,
+            )
+            if guard_stats['correction_limited']:
+                correction_limited_frames += 1
+            if guard_stats['pairwise_guarded']:
+                pairwise_guarded_frames += 1
+            if guard_stats['pairwise_rejected']:
+                pairwise_rejected_frames += 1
+            correction_deltas_mm.extend(guard_stats['delta_mm'])
+
+            if guard_stats['applied']:
+                error, marker_errors = _rigid_reprojection_error(
+                    corrected_points,
+                    x_obs[row_id][:, keypoint_indices],
+                    y_obs[row_id][:, keypoint_indices],
+                    likelihood_obs[row_id][:, keypoint_indices],
+                    projection_matrices,
+                    fit['used_cams'],
+                )
+                if not np.isfinite(error):
+                    error = fit['error']
+                    marker_errors = fit['marker_errors']
+
+                Q_df.iloc[row_id, columns] = corrected_points.reshape(-1)
+                for local_marker_id, keypoint_idx in enumerate(keypoint_indices):
+                    marker_error = marker_errors[local_marker_id]
+                    error_df.iat[row_id, keypoint_idx] = marker_error if np.isfinite(marker_error) else error
+                    nb_cams_excluded_df.iat[row_id, keypoint_idx] = len(fit['excluded_cams'])
+                    id_excluded_cams_df.iat[row_id, keypoint_idx] = fit['excluded_cams']
+                applied_frames += 1
+
             accepted_errors.append(error)
 
         mean_error = float(np.mean(accepted_errors)) if accepted_errors else np.nan
+        mean_delta_mm = float(np.mean(correction_deltas_mm)) if correction_deltas_mm else np.nan
+        max_delta_mm = float(np.max(correction_deltas_mm)) if correction_deltas_mm else np.nan
+        elapsed_seconds = time.perf_counter() - start_time
         stats.append({
             'name': group_name,
             'accepted': accepted_frames,
+            'applied': applied_frames,
             'total': len(Q_df),
             'mean_error': mean_error,
+            'mean_delta_mm': mean_delta_mm,
+            'max_delta_mm': max_delta_mm,
+            'correction_limited_frames': correction_limited_frames,
+            'pairwise_guarded_frames': pairwise_guarded_frames,
+            'pairwise_rejected_frames': pairwise_rejected_frames,
+            'elapsed_seconds': elapsed_seconds,
         })
         logging.info(
             f"Rigid marker group {group_name} for person {id_person}: accepted "
             f"{accepted_frames}/{len(Q_df)} frames"
-            + (f" with mean joint reprojection error {mean_error:.1f} px." if np.isfinite(mean_error) else ".")
+            + (f" with mean joint reprojection error {mean_error:.1f} px" if np.isfinite(mean_error) else "")
+            + f"; applied {applied_frames}/{len(Q_df)} frames"
+            + (f"; mean correction {mean_delta_mm:.1f} mm" if np.isfinite(mean_delta_mm) else "")
+            + (f", max correction {max_delta_mm:.1f} mm" if np.isfinite(max_delta_mm) else "")
+            + f"; correction limit adjusted {correction_limited_frames} frames"
+            + f"; pairwise guard adjusted {pairwise_guarded_frames} frames"
+            + f", rejected {pairwise_rejected_frames}"
+            + f"; elapsed {elapsed_seconds:.2f} s."
         )
 
     return stats
@@ -1207,6 +1503,15 @@ def triangulate_all(config_dict):
     keypoints_names = [node.name for _, _, node in RenderTree(model) if node.id!=None]
     keypoints_idx = list(range(len(keypoints_ids)))
     keypoints_nb = len(keypoints_ids)
+    marker_fill_overrides = _large_gap_marker_fill_overrides(config_dict, keypoints_names)
+    if marker_fill_overrides:
+        logging.info(
+            'Large-gap fill marker overrides: %s.',
+            ', '.join(
+                f'{keypoints_names[keypoint_id]}={fill_mode}'
+                for keypoint_id, fill_mode in marker_fill_overrides.items()
+            ),
+        )
     rigid_groups = parse_rigid_marker_groups(config_dict, keypoints_names)
     # for pre, _, node in RenderTree(model): 
     #     print(f'{pre}{node.name} id={node.id}')
@@ -1437,12 +1742,13 @@ def triangulate_all(config_dict):
         zero_nan_frames_per_kpt = [zero_nan_frames[1][np.where(zero_nan_frames[0]==k)[0]] for k in range(keypoints_nb)]
         zero_nan_frames_per_kpt = [z[(first_run_start_min < z) & (last_run_end_max > z)] for z in zero_nan_frames_per_kpt]
 
-        # Fill non-interpolated values with last valid one
-        if fill_large_gaps_with == 'last_value':
-            Q_tot[n] = Q_tot[n].ffill(axis=0).bfill(axis=0)
-            Q_tot[n].replace([np.nan, np.inf], 0, inplace=True)
-        elif fill_large_gaps_with == 'zeros':
-            Q_tot[n].replace([np.nan, np.inf], 0, inplace=True)
+        Q_tot[n] = _apply_large_gap_fill(
+            Q_tot[n],
+            zero_nan_frames_per_kpt,
+            keypoints_names,
+            fill_large_gaps_with,
+            marker_fill_overrides,
+        )
 
         # Create TRC file
         trc_paths.append(make_trc(config_dict, Q_tot[n], keypoints_names, id_person=n))

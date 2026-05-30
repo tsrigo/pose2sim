@@ -33,6 +33,8 @@ from tqdm import tqdm
 from Pose2Sim.Pose2Sim import recursive_update, setup_logging
 from Pose2Sim.common import natural_sort_key
 from Pose2Sim.poseEstimation import (
+    _make_pose_temporal_smoother,
+    pose_temporal_smoothing_config,
     save_to_openpose,
     setup_backend_device,
     setup_model_class_mode,
@@ -64,6 +66,7 @@ class VideoStats:
     total_frames: int = 0
     dropped_frames: int = 0
     detection_misses: int = 0
+    low_average_pose_frames: int = 0
     pose_batches: int = 0
 
 
@@ -424,8 +427,10 @@ def flush_pose_queue(
     json_dir,
     video_stem,
     average_likelihood_threshold_pose,
+    drop_low_average_pose,
     stats,
     kpt_count,
+    temporal_smoother=None,
 ):
     if not queue:
         return
@@ -440,8 +445,13 @@ def flush_pose_queue(
 
         average_score = float(np.nanmean(scores)) if scores.size else np.nan
         if not np.isfinite(average_score) or average_score < average_likelihood_threshold_pose:
-            keypoints, scores = empty_detection_arrays(kpt_count)
-            stats.dropped_frames += 1
+            stats.low_average_pose_frames += 1
+            if drop_low_average_pose:
+                keypoints, scores = empty_detection_arrays(kpt_count)
+                stats.dropped_frames += 1
+
+        if temporal_smoother is not None:
+            keypoints, scores = temporal_smoother.smooth(keypoints, scores, item.frame_idx)
 
         save_to_openpose(
             str(json_dir / f'{video_stem}_{item.frame_idx:06d}.json'),
@@ -462,7 +472,9 @@ def process_video(
     batch_size,
     det_frequency,
     average_likelihood_threshold_pose,
+    drop_low_average_pose,
     kpt_count,
+    temporal_smoothing_config=None,
 ):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -472,6 +484,7 @@ def process_video(
     stats = VideoStats(total_frames=effective_range[1] - effective_range[0])
     queue = []
     previous_bbox = None
+    temporal_smoother = _make_pose_temporal_smoother(temporal_smoothing_config)
 
     for frame_idx in tqdm(
         range(effective_range[0], effective_range[1]),
@@ -501,10 +514,14 @@ def process_video(
                 json_dir,
                 video_stem,
                 average_likelihood_threshold_pose,
+                drop_low_average_pose,
                 stats,
                 kpt_count,
+                temporal_smoother=temporal_smoother,
             )
             keypoints, scores = empty_detection_arrays(kpt_count)
+            if temporal_smoother is not None:
+                keypoints, scores = temporal_smoother.smooth(keypoints, scores, frame_idx)
             save_to_openpose(
                 str(json_dir / f'{video_path.stem}_{frame_idx:06d}.json'),
                 keypoints,
@@ -523,8 +540,10 @@ def process_video(
                 json_dir,
                 video_stem,
                 average_likelihood_threshold_pose,
+                drop_low_average_pose,
                 stats,
                 kpt_count,
+                temporal_smoother=temporal_smoother,
             )
 
     flush_pose_queue(
@@ -533,17 +552,20 @@ def process_video(
         json_dir,
         video_stem,
         average_likelihood_threshold_pose,
+        drop_low_average_pose,
         stats,
         kpt_count,
+        temporal_smoother=temporal_smoother,
     )
     cap.release()
 
     logging.info(
-        '%s: processed %d frames, dropped %d, detection misses %d, pose batches %d.',
+        '%s: processed %d frames, dropped %d, detection misses %d, low-average poses %d, pose batches %d.',
         video_path.name,
         stats.total_frames,
         stats.dropped_frames,
         stats.detection_misses,
+        stats.low_average_pose_frames,
         stats.pose_batches,
     )
     return stats
@@ -556,7 +578,7 @@ def run_batched_pose_export(config_dict, batch_size, backend, device, overwrite_
     pose_dir.mkdir(parents=True, exist_ok=True)
 
     avi_files = find_avi_files(video_dir)
-    effective_range, _ = resolve_effective_frame_range(config_dict, avi_files)
+    effective_range, video_metadata = resolve_effective_frame_range(config_dict, avi_files)
     has_existing_pose_dirs = ensure_clean_output_dirs(project_dir, avi_files, overwrite_pose)
 
     if has_existing_pose_dirs:
@@ -575,15 +597,23 @@ def run_batched_pose_export(config_dict, batch_size, backend, device, overwrite_
         'average_likelihood_threshold_pose',
         0.5,
     )
+    drop_low_average_pose = bool(config_dict.get('pose', {}).get(
+        'drop_low_average_pose',
+        False,
+    ))
     det_frequency = int(config_dict.get('pose', {}).get('det_frequency', 4))
     if det_frequency < 1:
         raise ValueError('det_frequency must be an integer greater or equal to 1.')
 
-    _, det_model, pose_model, kpt_count = instantiate_topdown_solution(
+    pose_model_tree, det_model, pose_model, kpt_count = instantiate_topdown_solution(
         config_dict,
         backend,
         device,
     )
+    frame_rate = config_dict.get('project', {}).get('frame_rate', 'auto')
+    if frame_rate in ('auto', None):
+        frame_rate = video_metadata[0]['fps'] if video_metadata else 30
+    temporal_smoothing_config = pose_temporal_smoothing_config(config_dict, pose_model_tree, frame_rate)
 
     logging.info(
         'Running batched pose export with backend=%s, device=%s, batch_size=%d, det_frequency=%d.',
@@ -596,6 +626,26 @@ def run_batched_pose_export(config_dict, batch_size, backend, device, overwrite_
         'Using RTMLib pose model "%s".',
         config_dict.get('pose', {}).get('pose_model', 'Body_with_feet'),
     )
+    if drop_low_average_pose:
+        logging.info(
+            'Low-average pose frames are dropped when mean keypoint likelihood is below %s.',
+            average_likelihood_threshold_pose,
+        )
+    else:
+        logging.info(
+            'Low-average pose frames are retained; per-keypoint likelihoods will be handled by triangulation.'
+        )
+    if temporal_smoothing_config.get('enabled', False):
+        logging.info(
+            '2D temporal smoothing enabled for avi_to_trc: OneEuro '
+            'min_cutoff=%s, beta=%s, d_cutoff=%s, min_likelihood=%s, '
+            'foot_anchor_guard=%s.',
+            temporal_smoothing_config['min_cutoff'],
+            temporal_smoothing_config['beta'],
+            temporal_smoothing_config['d_cutoff'],
+            temporal_smoothing_config['min_likelihood'],
+            temporal_smoothing_config.get('foot_anchor_guard', False),
+        )
 
     stats_by_video = {}
     for video_path in avi_files:
@@ -611,7 +661,9 @@ def run_batched_pose_export(config_dict, batch_size, backend, device, overwrite_
             batch_size=batch_size,
             det_frequency=det_frequency,
             average_likelihood_threshold_pose=average_likelihood_threshold_pose,
+            drop_low_average_pose=drop_low_average_pose,
             kpt_count=kpt_count,
+            temporal_smoothing_config=temporal_smoothing_config,
         )
 
     return avi_files, effective_range, True

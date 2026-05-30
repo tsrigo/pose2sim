@@ -85,6 +85,15 @@ overwrite_pose = false # Set to false if you don't want to recalculate pose esti
 save_video = 'to_video' # 'to_video' or 'to_images', 'none', or ['to_video', 'to_images']
 output_format = 'openpose' # 'openpose', 'mmpose', 'deeplabcut', 'none' or a list of them # /!\ only 'openpose' is supported for now
 
+temporal_smoothing = false # true to smooth 2D keypoints before writing pose JSON. Useful when RTMPose jitters on static subjects.
+temporal_smoothing_method = 'one_euro'
+temporal_smoothing_min_cutoff = 1.0
+temporal_smoothing_beta = 0.02
+temporal_smoothing_d_cutoff = 1.0
+temporal_smoothing_min_likelihood = 0.3
+temporal_smoothing_max_gap = 5
+temporal_smoothing_keypoints = 'all' # 'all' or a list like ['Hip', 'RHip', 'LHip', 'RAnkle', 'LAnkle']
+
 average_likelihood_threshold_pose = 0.5 # Detections dropped if their average keypoint likelihood is below average_likelihood_threshold_pose
 tracking_mode = 'sports2d' # 'none', 'sports2d' or 'deepsort'. 'deepsort' is slower but more robust in difficult configurations
 max_distance_px = 100  # px # If a person is detected further than max_distance from its position on the previous frame, it will be considered as a new one
