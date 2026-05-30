@@ -8,7 +8,8 @@
 ###########################################################################
 
 Run RTMLib pose estimation on synchronized multi-camera AVI videos, export
-OpenPose-style JSON detections, then triangulate them into a standard 3D TRC.
+OpenPose-style JSON detections, triangulate them into a standard 3D TRC, and
+optionally generate a 2×2 pose-overlay mosaic video and apply 3D filtering.
 
 The batching is applied to the pose model crops. Detection stays frame-wise,
 which matches the shipped YOLOX ONNX detector shape.
@@ -18,6 +19,7 @@ which matches the shipped YOLOX ONNX detector shape.
 ## INIT
 import argparse
 import glob
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -31,7 +33,8 @@ import toml
 from tqdm import tqdm
 
 from Pose2Sim.Pose2Sim import recursive_update, setup_logging
-from Pose2Sim.common import natural_sort_key
+from Pose2Sim.common import draw_keypts, draw_skel, natural_sort_key
+from Pose2Sim.filtering import filter_all
 from Pose2Sim.poseEstimation import (
     _make_pose_temporal_smoother,
     pose_temporal_smoothing_config,
@@ -301,7 +304,7 @@ def instantiate_topdown_solution(config_dict, backend, device):
 
     if getattr(solution, 'one_stage', False) or not hasattr(solution, 'det_model'):
         raise NotImplementedError(
-            'avi_to_trc only supports top-down RTMLib models with an explicit '
+            'avi2trc only supports top-down RTMLib models with an explicit '
             'detector and pose model.'
         )
 
@@ -316,6 +319,16 @@ def instantiate_topdown_solution(config_dict, backend, device):
         raise ValueError('Could not determine any keypoint IDs from the selected pose model.')
 
     return pose_model_tree, solution.det_model, solution.pose_model, max(keypoint_ids) + 1
+
+
+def _get_skeleton_tree_and_kpt_count(config_dict):
+    '''Return the skeleton tree and keypoint count without loading neural networks.'''
+    pose_model_name = config_dict.get('pose', {}).get('pose_model', 'Body_with_feet')
+    mode = config_dict.get('pose', {}).get('mode', 'balanced')
+    pose_model_tree, _, _ = setup_model_class_mode(pose_model_name, mode, config_dict)
+    keypoint_ids = [node.id for _, _, node in RenderTree(pose_model_tree) if node.id is not None]
+    kpt_count = max(keypoint_ids) + 1 if keypoint_ids else 26
+    return pose_model_tree, kpt_count
 
 
 def normalize_bboxes(raw_boxes):
@@ -637,7 +650,7 @@ def run_batched_pose_export(config_dict, batch_size, backend, device, overwrite_
         )
     if temporal_smoothing_config.get('enabled', False):
         logging.info(
-            '2D temporal smoothing enabled for avi_to_trc: OneEuro '
+            '2D temporal smoothing enabled for avi2trc: OneEuro '
             'min_cutoff=%s, beta=%s, d_cutoff=%s, min_likelihood=%s, '
             'foot_anchor_guard=%s.',
             temporal_smoothing_config['min_cutoff'],
@@ -669,6 +682,121 @@ def run_batched_pose_export(config_dict, batch_size, backend, device, overwrite_
     return avi_files, effective_range, True
 
 
+## MOSAIC VIDEO
+
+def _load_pose_json(json_path, kpt_count, score_threshold):
+    x = np.full(kpt_count, np.nan, dtype=np.float32)
+    y = np.full(kpt_count, np.nan, dtype=np.float32)
+    scores = np.zeros(kpt_count, dtype=np.float32)
+
+    if not Path(json_path).is_file():
+        return x[None, :], y[None, :], scores[None, :]
+
+    people = json.loads(Path(json_path).read_text()).get('people') or []
+    if not people:
+        return x[None, :], y[None, :], scores[None, :]
+
+    values = people[0].get('pose_keypoints_2d') or []
+    for kpt_id in range(min(kpt_count, len(values) // 3)):
+        px, py, score = values[kpt_id * 3:kpt_id * 3 + 3]
+        scores[kpt_id] = score
+        if score > score_threshold and not (px == 0 and py == 0):
+            x[kpt_id] = px
+            y[kpt_id] = py
+
+    return x[None, :], y[None, :], scores[None, :]
+
+
+def make_pose2d_mosaic_video(
+    project_dir,
+    avi_files,
+    effective_range,
+    pose_model_tree,
+    kpt_count,
+    scale=0.35,
+    score_threshold=0.1,
+):
+    '''
+    Generate a 2×N tiled mosaic video with pose keypoints drawn from JSON outputs.
+
+    Reads AVI frames from project_dir/videos/ and JSON from project_dir/pose/,
+    tiles them in a 2-column grid, and writes to project_dir/pose/<trial>_pose2d_mosaic.mp4.
+    '''
+    project_dir = Path(project_dir)
+    pose_dir = project_dir / 'pose'
+    trial_name = project_dir.name
+    output_path = pose_dir / f'{trial_name}_pose2d_mosaic.mp4'
+
+    n_cams = len(avi_files)
+    if n_cams < 1:
+        logging.warning('make_pose2d_mosaic_video: no AVI files, skipping mosaic.')
+        return
+
+    captures = [cv2.VideoCapture(str(f)) for f in avi_files]
+    try:
+        if any(not cap.isOpened() for cap in captures):
+            logging.warning('make_pose2d_mosaic_video: could not open all AVI files, skipping mosaic.')
+            return
+
+        fps = captures[0].get(cv2.CAP_PROP_FPS) or 30.0
+        src_w = int(captures[0].get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(captures[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
+        tile_w = int(round(src_w * scale))
+        tile_h = int(round(src_h * scale))
+        cols = 2
+        rows = (n_cams + cols - 1) // cols
+        mosaic_w = tile_w * cols
+        mosaic_h = tile_h * rows
+
+        for cap in captures:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, effective_range[0])
+
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*'mp4v'),
+            fps,
+            (mosaic_w, mosaic_h),
+        )
+        if not writer.isOpened():
+            logging.warning('make_pose2d_mosaic_video: could not open VideoWriter, skipping mosaic.')
+            return
+
+        camera_names = [f.stem for f in avi_files]
+        total_frames = effective_range[1] - effective_range[0]
+
+        for rel_idx in tqdm(range(total_frames), desc='Making pose2d mosaic'):
+            frame_idx = effective_range[0] + rel_idx
+            tiles = []
+            for cam_name, cap in zip(camera_names, captures):
+                ok, frame = cap.read()
+                if not ok:
+                    frame = np.zeros((src_h, src_w, 3), dtype=np.uint8)
+
+                json_path = pose_dir / f'{cam_name}_json' / f'{cam_name}_{frame_idx:06d}.json'
+                x, y, scores = _load_pose_json(json_path, kpt_count, score_threshold)
+                frame = draw_keypts(frame, x, y, scores, cmap_str='RdYlGn')
+                frame = draw_skel(frame, x, y, pose_model_tree)
+                cv2.rectangle(frame, (0, 0), (frame.shape[1], 44), (0, 0, 0), -1)
+                cv2.putText(frame, f'{cam_name} F{frame_idx}', (16, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                tiles.append(cv2.resize(frame, (tile_w, tile_h), interpolation=cv2.INTER_AREA))
+
+            while len(tiles) < rows * cols:
+                tiles.append(np.zeros((tile_h, tile_w, 3), dtype=np.uint8))
+
+            row_imgs = [np.hstack(tiles[r * cols:(r + 1) * cols]) for r in range(rows)]
+            writer.write(np.vstack(row_imgs))
+
+        writer.release()
+        logging.info('--> Pose2D mosaic video saved to %s.', output_path)
+
+    finally:
+        for cap in captures:
+            cap.release()
+
+
+## TRIANGULATION
+
 def triangulate_trial(config_dict):
     project_dir = Path(config_dict.get('project', {}).get('project_dir', '.')).resolve()
     run_dir = resolve_session_dir(project_dir)
@@ -680,7 +808,9 @@ def triangulate_trial(config_dict):
         os.chdir(previous_cwd)
 
 
-def avi_to_trc(
+## MAIN PIPELINE
+
+def avi2trc(
     trial_dir,
     config_path=None,
     batch_size=16,
@@ -691,6 +821,12 @@ def avi_to_trc(
 ):
     '''
     Main callable entrypoint for the AVI -> pose JSON -> 3D TRC workflow.
+
+    Config options (in Config.toml):
+      [pose]
+        save_video = 'none'    # 'none' or 'mosaic' — generate 2×N pose overlay video
+      [filtering]
+        filter = false         # set true to also produce a *_filt_butterworth.trc
     '''
 
     config_dict = load_trial_config(trial_dir, config_path=config_path)
@@ -704,14 +840,14 @@ def avi_to_trc(
 
     if config_dict.get('project', {}).get('multi_person', False):
         logging.warning(
-            'multi_person=true is not supported by avi_to_trc v1. Forcing single-person mode.'
+            'multi_person=true is not supported by avi2trc. Forcing single-person mode.'
         )
         config_dict['project']['multi_person'] = False
 
     output_format = config_dict.get('pose', {}).get('output_format', 'openpose')
     if output_format != 'openpose':
         logging.warning(
-            'avi_to_trc requires OpenPose-style JSON for downstream triangulation. '
+            'avi2trc requires OpenPose-style JSON for downstream triangulation. '
             'Forcing output_format="openpose".'
         )
         config_dict.setdefault('pose', {})
@@ -750,6 +886,18 @@ def avi_to_trc(
             'At least two camera JSON streams are required before triangulation.'
         )
 
+    # Mosaic video
+    save_video = config_dict.get('pose', {}).get('save_video', 'none')
+    if save_video not in (False, 'none', 'None', None, '', 0):
+        pose_model_tree, kpt_count = _get_skeleton_tree_and_kpt_count(config_dict)
+        make_pose2d_mosaic_video(
+            project_dir=project_dir,
+            avi_files=avi_files,
+            effective_range=effective_range,
+            pose_model_tree=pose_model_tree,
+            kpt_count=kpt_count,
+        )
+
     logging.info(
         'Triangulating %d camera streams for frames [%d, %d).',
         successful_streams,
@@ -757,12 +905,20 @@ def avi_to_trc(
         effective_range[1],
     )
     triangulate_trial(config_dict)
+
+    # 3D filtering (controlled by [filtering] filter = true/false in Config.toml)
+    filter_all(config_dict)
+
     return {
         'project_dir': str(project_dir),
         'pose_exported': pose_ran,
         'camera_count': successful_streams,
         'frame_range': effective_range,
     }
+
+
+# Backward-compat alias
+avi_to_trc = avi2trc
 
 
 def parse_args(argv=None):
@@ -811,7 +967,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    avi_to_trc(
+    avi2trc(
         trial_dir=args.trial_dir,
         config_path=args.config,
         batch_size=args.batch_size,
