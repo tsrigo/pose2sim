@@ -127,6 +127,40 @@ rigid_group_spike_min_bad_pairs = 2
 
 这些配置用于降低同一刚体局部 marker 的相对抖动，例如 PnVision 腰部 `Hip/RHip/LHip`。三角化阶段和滤波阶段现在默认都是近似刚体：用刚体拟合结果稳定轨迹，但会混回 baseline，并限制单点修正量、组内距离变化和修正额外引入的逐帧位移；对已经明显偏离局部模板的帧，只接受能让组内距离更接近模板的修正，避免髋部比例被压缩或在开关修正时出现突变。`rigid_group_repair_pairwise_spikes` 只在显式开启时处理短时组内距离尖峰：它会找出最可能出错的局部 marker，并只对短片段做相邻有效帧插值。如果没有配置，现有 Pose2Sim 行为保持不变。
 
+## 生产级稳定增强（弯腰 / 转身 / 行走 / 遮挡）
+
+在基础刚体组之上，本分支针对真实 PnVision 试验中观察到的伪影增加了若干**默认开启**的护栏（仅在配置了对应刚体组时才参与计算；不配置刚体组则现有行为不变）。这些选项写在 `rigid_marker_groups` 条目里（短名会自动加前缀 `rigid_group_*`），实现都在 `Pose2Sim/triangulation.py`。
+
+```toml
+[triangulation]
+rigid_marker_groups = [
+  { name = "pelvis", markers = ["Hip", "RHip", "LHip"],
+    blend = 1.0, fill_missing = true,
+    reproj_error_threshold = 45, smoothing_window = 9,
+    smoothing_method = "robust", orientation_window = 15, orientation_tol_deg = 35,
+    chirality_guard = true, chirality_hold = true,
+    twist_guard = true, max_twist_deg = 50 },
+  { name = "head",   markers = ["Head","Nose","REye","LEye","REar","LEar"],
+    blend = 1.0, fill_missing = true,
+    reproj_error_threshold = 25, smoothing_window = 9 }
+]
+
+# 非物理肢体护栏（全局，默认开启）
+reject_nonphysical_limbs = true
+limb_length_max_ratio = 1.8
+limb_length_min_excess_m = 0.15
+```
+
+各护栏要解决的问题：
+
+- **手性护栏 `chirality_guard` + `chirality_hold`**：行走时骨盆侧向轴沿相机深度方向被透视压缩（foreshortening）+ 背向相机，刚体拟合会以几乎为零的 2D 代价 180° 翻转，导致 RHip/LHip 左右互换。护栏以独立三角化（逐 marker，不可能换边）为基准方向，翻转帧拒绝刚体结果；基准为 NaN 时用时间连续性（相邻 30fps 帧 yaw 不可能突变 180°）。`chirality_hold` 在拒绝帧不回退到退化的独立解，而是把上一可信朝向以当前质心重定位后保持，避免骨盆宽度塌缩。
+- **鲁棒 SO(3) 朝向平滑 `smoothing_method = "robust"`**：foreshortening 下 yaw 病态，逐分量中值无法剔除轴角向量上的非线性翻转尖峰。改为在 SO(3) 上取测地中值点（geodesic medoid），保留渐变真实运动、剔除尖峰。
+- **解剖学扭转钳制 `twist_guard`**：刚体骨盆与躯干无耦合，会"像光滑的杆"过度旋转到非解剖角度。以肩线（RShoulder/LShoulder）为参考、绕竖直轴把骨盆相对躯干扭转钳制在 `max_twist_deg`（默认 50°，真实躯干旋转约 45°，故只在伪影帧触发）。
+- **Procrustes / Kabsch 刚体模板**：旧模板对居中后位置逐轴取中值，身体转动时会把形状压缩（不同朝向的 marker 互相抵消）。改为先用 Kabsch 把每个稳定模板帧旋到公共参考帧再取中值，无论是否转动都保住真实尺寸（yh644406 静态骨盆 14.5cm→22.4cm）。
+- **非物理肢体护栏 `reject_nonphysical_limbs`**：两相机分歧时独立三角化的手臂/肩膀可能炸到 1–2 m。沿骨骼树自根向叶，把同时超过 `max_ratio`×试验中值长度且绝对超出 `min_excess_m` 的骨段，沿当前方向把远端子节点拉回中值长度。`+0.15m` 绝对下限保证脚部正常抖动不被误伤；刚体组 marker 受保护不被移动。
+
+验证脚本：`scripts/verify_pelvis_jitter.py`（骨盆抖动/翻转/扭转指标，按 marker **名字** 解析，注意 TRC 中 RShoulder=21、LShoulder=24）、`scripts/verify_limb_guard.py`（肢体长度护栏前后对比）、`scripts/sweep_artifacts.py`（多试验骨段漂移 / L-R 互换 / 瞬移 / 非解剖扭转扫描）、`scripts/batch_validate.py` + `scripts/render_skeleton.py`（批量 + 骨架可视化 PNG 复核）、`scripts/audit_2d.py`（区分 2D 检测层 vs 三角化层伪影）。
+
 ## 同步官方 Pose2Sim
 
 建议保留两个远端：

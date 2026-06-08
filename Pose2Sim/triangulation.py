@@ -761,11 +761,36 @@ def parse_rigid_marker_groups(config_dict, keypoints_names):
                 opt_key = key if key.startswith('rigid_group_') else f'rigid_group_{key}'
                 options[opt_key] = value
 
+        # Resolve a twist-clamp reference (e.g. the shoulders) into column indices, so
+        # refine_rigid_marker_groups can keep the group's yaw within an anatomical
+        # twist of the reference axis when the group's own yaw is ill-conditioned.
+        twist = None
+        twist_guard = options.get('rigid_group_twist_guard',
+                                  triangulation_config.get('rigid_group_twist_guard', False))
+        if twist_guard:
+            ref_names = options.get('rigid_group_twist_ref_markers',
+                                    triangulation_config.get('rigid_group_twist_ref_markers', ['RShoulder', 'LShoulder']))
+            up_names = options.get('rigid_group_twist_up_markers',
+                                   triangulation_config.get('rigid_group_twist_up_markers', ['Hip', 'Neck']))
+            if all(n in keypoints_names for n in ref_names) and all(n in keypoints_names for n in up_names):
+                twist = {
+                    'ref': [keypoints_names.index(n) for n in ref_names],   # [R, L] -> ref_lat = R - L
+                    'up': [keypoints_names.index(n) for n in up_names],     # [base, top] -> up = top - base
+                    'max_deg': float(options.get('rigid_group_max_twist_deg',
+                                                 triangulation_config.get('rigid_group_max_twist_deg', 50.0))),
+                }
+            else:
+                logging.warning(
+                    f"Rigid group {group_name or group_id}: twist guard needs markers "
+                    f"{ref_names} + {up_names}; some are missing, disabling it."
+                )
+
         groups.append({
             'name': group_name or '+'.join(present_markers),
             'markers': present_markers,
             'indices': indices,
             'options': options,
+            'twist': twist,
         })
 
     return groups
@@ -786,6 +811,17 @@ def _rigid_group_columns(keypoint_indices):
 def _extract_group_points(Q_df, keypoint_indices):
     columns = _rigid_group_columns(keypoint_indices)
     return Q_df.iloc[:, columns].to_numpy(dtype=float).reshape(len(Q_df), len(keypoint_indices), 3)
+
+
+def _kabsch_rotation(source, target):
+    '''Rotation (proper, det=+1) that best aligns centred ``source`` onto centred
+    ``target`` (same marker order, all finite) in the least-squares sense.'''
+    u, _, vt = np.linalg.svd(source.T @ target)
+    r = vt.T @ u.T
+    if np.linalg.det(r) < 0:
+        vt[-1, :] *= -1
+        r = vt.T @ u.T
+    return r
 
 
 def _build_rigid_template(group_points, group_name, config_dict, group_options=None):
@@ -809,6 +845,7 @@ def _build_rigid_template(group_points, group_name, config_dict, group_options=N
             f'(requested {min_template_frames}). Using the available frames.'
         )
 
+    median_distances = None
     if candidate_points.shape[1] >= 2 and len(candidate_points) >= 5:
         pairwise_distances = []
         for marker_i, marker_j in it.combinations(range(candidate_points.shape[1]), 2):
@@ -822,7 +859,26 @@ def _build_rigid_template(group_points, group_name, config_dict, group_options=N
             candidate_points = candidate_points[stable_frames]
 
     centered_points = candidate_points - np.mean(candidate_points, axis=1, keepdims=True)
-    template = np.nanmedian(centered_points, axis=0)
+    # Per-axis median of the raw centered positions SHRINKS the shape when the body
+    # rotates between frames (the marker directions vary, so their component-wise
+    # median collapses toward the centroid -> a too-narrow pelvis for turning
+    # subjects). Rotate every frame onto a common reference (the medoid frame, whose
+    # pairwise distances best match the trial median) before the median, so the
+    # template keeps the true marker distances regardless of how much the body turned.
+    if centered_points.shape[1] >= 3 and len(centered_points) >= 5:
+        per_frame_dists = np.stack([
+            np.array([np.linalg.norm(frame[i] - frame[j])
+                      for i, j in it.combinations(range(centered_points.shape[1]), 2)])
+            for frame in centered_points
+        ])
+        ref_target = median_distances if median_distances is not None else np.nanmedian(per_frame_dists, axis=0)
+        reference = centered_points[int(np.argmin(np.nansum(np.abs(per_frame_dists - ref_target), axis=1)))]
+        aligned = np.empty_like(centered_points)
+        for k, frame in enumerate(centered_points):
+            aligned[k] = (_kabsch_rotation(frame, reference) @ frame.T).T
+        template = np.nanmedian(aligned, axis=0)
+    else:
+        template = np.nanmedian(centered_points, axis=0)
     template = template - np.mean(template, axis=0, keepdims=True)
     if not np.all(np.isfinite(template)):
         logging.warning(f'Rigid marker group {group_name} produced a non-finite template. Skipping it.')
@@ -1019,6 +1075,93 @@ def _fit_rigid_group_frame(config_dict, template, baseline_points, x_obs, y_obs,
     return best_fit
 
 
+def _rotation_angle_deg(r_a, r_b):
+    '''Geodesic (angular) distance in degrees between two rotation matrices.'''
+    cos = (np.trace(r_a.T @ r_b) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+
+def _average_rotations(rot_mats):
+    '''Chordal-L2 average of rotation matrices, projected back onto SO(3) via SVD.'''
+    mean = np.mean(np.stack(rot_mats, axis=0), axis=0)
+    u, _, vt = np.linalg.svd(mean)
+    r = u @ vt
+    if np.linalg.det(r) < 0:
+        u[:, -1] *= -1
+        r = u @ vt
+    return r
+
+
+def _robust_smooth_rotations(rvecs, window, ang_tol_deg):
+    '''Outlier-robust temporal smoothing of a sequence of rotations (axis-angle rows).
+
+    Component-wise median/mean of axis-angle vectors does NOT robustly reject
+    orientation outliers: a 180 deg yaw flip is a large, non-linear jump in rvec, so
+    when the rigid pelvis is foreshortened (its medio-lateral axis pointing along the
+    cameras' depth, yaw ~90 deg) the ill-conditioned per-frame yaw spikes/flips
+    survive component smoothing. Instead, for each frame take the geodesic *medoid*
+    of the rotations in a centred window (robust to <50% outliers), keep only the
+    members within ``ang_tol_deg`` of it, and return their chordal average. Brief
+    foreshortening spikes are outvoted by the surrounding stable orientation.'''
+    n = len(rvecs)
+    mats = [cv2.Rodrigues(rvecs[i])[0] if np.all(np.isfinite(rvecs[i])) else None for i in range(n)]
+    out = np.full((n, 3), np.nan)
+    half = max(int(window) // 2, 0)
+    for i in range(n):
+        if mats[i] is None:
+            continue
+        members = [mats[j] for j in range(max(0, i - half), min(n, i + half + 1)) if mats[j] is not None]
+        if len(members) == 1:
+            out[i] = cv2.Rodrigues(members[0])[0].ravel()
+            continue
+        dists = [[_rotation_angle_deg(a, b) for b in members] for a in members]
+        medoid_idx = int(np.argmin([sum(row) for row in dists]))
+        inliers = [members[k] for k in range(len(members)) if dists[medoid_idx][k] <= ang_tol_deg]
+        out[i] = cv2.Rodrigues(_average_rotations(inliers))[0].ravel()
+    return out
+
+
+def _twist_angle_deg(pel_lat, ref_lat, up, min_len=1e-3):
+    '''Signed azimuthal angle (deg) from ref_lat to pel_lat about the up axis, after
+    removing each vector's up component (so it measures twist about up only). None if
+    any input is missing or degenerate in the plane perpendicular to up.'''
+    if not (np.all(np.isfinite(pel_lat)) and np.all(np.isfinite(ref_lat)) and np.all(np.isfinite(up))):
+        return None
+    un = np.linalg.norm(up)
+    if un < min_len:
+        return None
+    u = up / un
+    p = pel_lat - np.dot(pel_lat, u) * u
+    r = ref_lat - np.dot(ref_lat, u) * u
+    if np.linalg.norm(p) < min_len or np.linalg.norm(r) < min_len:
+        return None
+    return float(np.degrees(np.arctan2(np.dot(np.cross(r, p), u), np.dot(r, p))))
+
+
+def _clamp_twist(rigid_points, pelvis_pair, ref_markers, up_markers, offset_deg, max_deg):
+    '''Clamp the rigid group's azimuthal twist relative to a reference axis (the
+    shoulders) to within +/-max_deg of the natural offset, by rotating the whole group
+    about the up axis through its centroid. This preserves the rigid shape, width and
+    pitch; only the ill-conditioned yaw changes. Anatomical trunk axial rotation maxes
+    ~45 deg, so a >50 deg pelvis-vs-shoulder twist is non-physical -- a foreshortening
+    artifact -- and the well-observed shoulders are the reference that resolves it.'''
+    left_idx, right_idx = pelvis_pair
+    pel_lat = rigid_points[right_idx] - rigid_points[left_idx]
+    ref_lat = ref_markers[0] - ref_markers[1]   # R - L
+    up = up_markers[1] - up_markers[0]           # top - base (Neck - Hip)
+    tw = _twist_angle_deg(pel_lat, ref_lat, up)
+    if tw is None:
+        return rigid_points, False
+    rel = ((tw - offset_deg) + 180.0) % 360.0 - 180.0
+    if abs(rel) <= max_deg:
+        return rigid_points, False
+    delta = np.radians(np.clip(rel, -max_deg, max_deg) - rel)
+    axis = up / np.linalg.norm(up)
+    R = cv2.Rodrigues(axis * delta)[0]
+    centroid = rigid_points.mean(axis=0)
+    return (R @ (rigid_points - centroid).T).T + centroid, True
+
+
 def _smooth_rigid_params(fits, config_dict, group_options=None):
     triangulation_config = config_dict.get('triangulation', {})
     window = _rigid_param(group_options, triangulation_config, 'rigid_group_smoothing_window', 5)
@@ -1039,7 +1182,17 @@ def _smooth_rigid_params(fits, config_dict, group_options=None):
     # so it leaves depth-ambiguity steps at gap boundaries untouched. 'mean' (and
     # 'median_then_mean') distribute such steps into a gentle ramp — appropriate for
     # slow-moving groups like the pelvis where genuine motion has no sharp edges.
-    if method == 'mean':
+    # 'robust' smooths the translation like 'median_then_mean' but smooths the
+    # rotation on SO(3) with geodesic-medoid outlier rejection — needed when the
+    # group is foreshortened and its per-frame yaw is ill-conditioned (pelvis).
+    if method == 'robust':
+        orientation_window = _rigid_param(group_options, triangulation_config, 'rigid_group_orientation_window', window)
+        orientation_tol_deg = float(_rigid_param(group_options, triangulation_config, 'rigid_group_orientation_tol_deg', 35.0))
+        trans_median = params_df.iloc[:, 3:6].rolling(window=int(window), center=True, min_periods=1).median()
+        trans_smoothed = trans_median.rolling(window=int(window), center=True, min_periods=1).mean().to_numpy()
+        rot_smoothed = _robust_smooth_rotations(params[:, :3], int(orientation_window), orientation_tol_deg)
+        smoothed = np.concatenate([rot_smoothed, trans_smoothed], axis=1)
+    elif method == 'mean':
         smoothed = roll.mean().to_numpy()
     elif method in ('median_then_mean', 'median_mean'):
         median_df = roll.median()
@@ -1156,6 +1309,67 @@ def _guarded_rigid_points(config_dict, baseline_points, rigid_points, group_opti
     return corrected_points, stats
 
 
+def _rigid_chirality_pairs(group_markers):
+    '''List the (left_local_idx, right_local_idx) marker pairs in a rigid group,
+    i.e. markers named 'L<x>' / 'R<x>' (RHip/LHip, REye/LEye, ...). Local indices
+    are positions within ``group_markers`` (== rows of the template/rigid points).'''
+    name_to_local = {name: i for i, name in enumerate(group_markers)}
+    pairs = []
+    for name, right_idx in name_to_local.items():
+        if name.startswith('R') and ('L' + name[1:]) in name_to_local:
+            pairs.append((name_to_local['L' + name[1:]], right_idx))
+    return pairs
+
+
+def _rigid_chirality_ok(chirality_pairs, baseline_points, rigid_points, fallback_dirs):
+    '''Guard against the rigid fit settling into a left/right-swapped pose.
+
+    The pelvis markers (Hip/RHip/LHip) form a nearly flat, left/right-symmetric
+    triangle. When its medio-lateral axis foreshortens toward the cameras (e.g.
+    while walking side-on to the rig), a 180 deg yaw flip swaps RHip/LHip at
+    almost no reprojection cost, so the coupled rigid fit can lock onto the
+    swapped branch. Independent per-marker triangulation cannot swap sides (each
+    marker only ever uses its own 2D), so the independent baseline is the trusted
+    left/right reference.
+
+    For each L/R pair compare the rigid (R-L) vector against a reference: the
+    independent baseline (R-L) when both baseline markers are finite, otherwise
+    the last accepted frame's direction in ``fallback_dirs``. The latter matters
+    because ``refine`` runs before gap interpolation, so during occluded walking
+    the baseline pair is often NaN exactly where the flip happens; pelvis yaw is
+    temporally continuous, so a rigid fit pointing opposite the recent orientation
+    is a 180 deg flip artifact. Return False on any reversed pair.'''
+    for left_idx, right_idx in chirality_pairs:
+        rigid_left = rigid_points[left_idx]
+        rigid_right = rigid_points[right_idx]
+        if not (np.all(np.isfinite(rigid_left)) and np.all(np.isfinite(rigid_right))):
+            continue
+        baseline_left = baseline_points[left_idx]
+        baseline_right = baseline_points[right_idx]
+        if np.all(np.isfinite(baseline_left)) and np.all(np.isfinite(baseline_right)):
+            reference = baseline_right - baseline_left
+        else:
+            reference = fallback_dirs.get((left_idx, right_idx))
+        if reference is not None and np.dot(rigid_right - rigid_left, reference) < 0:
+            return False
+    return True
+
+
+def _update_chirality_dirs(chirality_pairs, baseline_points, rigid_points, fallback_dirs):
+    '''Carry the trusted left/right direction forward for the next frame: prefer the
+    independent baseline (R-L), else the just-accepted rigid (R-L).'''
+    for left_idx, right_idx in chirality_pairs:
+        baseline_left = baseline_points[left_idx]
+        baseline_right = baseline_points[right_idx]
+        if np.all(np.isfinite(baseline_left)) and np.all(np.isfinite(baseline_right)):
+            fallback_dirs[(left_idx, right_idx)] = baseline_right - baseline_left
+            continue
+        rigid_left = rigid_points[left_idx]
+        rigid_right = rigid_points[right_idx]
+        if np.all(np.isfinite(rigid_left)) and np.all(np.isfinite(rigid_right)):
+            fallback_dirs[(left_idx, right_idx)] = rigid_right - rigid_left
+
+
 def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df, id_excluded_cams_df,
                                observations, projection_matrices, rigid_groups, id_person=0):
     '''
@@ -1180,11 +1394,15 @@ def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df,
         return []
 
     stats = []
+    triangulation_config = config_dict.get('triangulation', {})
     for group in rigid_groups:
         start_time = time.perf_counter()
         group_name = group['name']
         keypoint_indices = group['indices']
         group_options = group.get('options')
+        chirality_guard = bool(_rigid_param(group_options, triangulation_config, 'rigid_group_chirality_guard', True))
+        chirality_hold = bool(_rigid_param(group_options, triangulation_config, 'rigid_group_chirality_hold', True))
+        chirality_pairs = _rigid_chirality_pairs(group['markers']) if chirality_guard else []
         group_points = _extract_group_points(Q_df, keypoint_indices)
         template = _build_rigid_template(group_points, group_name, config_dict, group_options)
         if template is None:
@@ -1219,9 +1437,42 @@ def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df,
         correction_limited_frames = 0
         pairwise_guarded_frames = 0
         pairwise_rejected_frames = 0
+        chirality_rejected_frames = 0
+        chirality_held_frames = 0
+        chirality_dirs = {}
+        last_accepted_rigid = None
         correction_deltas_mm = []
         columns = _rigid_group_columns(keypoint_indices)
         smoothed_params = _smooth_rigid_params(fits, config_dict, group_options)
+
+        # Twist clamp: keep the group's yaw within an anatomical twist of a reference
+        # axis (the shoulders), to fix the rare frames where the group's own yaw is
+        # ill-conditioned (foreshortened) and even robust smoothing leaves a
+        # non-physical pelvis-vs-torso twist. The natural twist offset is the trial
+        # median; genuine motion stays well inside the limit so the clamp only ever
+        # touches artifacts.
+        twist_cfg = group.get('twist')
+        lr_pairs = _rigid_chirality_pairs(group['markers'])
+        twist_pair = lr_pairs[0] if (twist_cfg and lr_pairs) else None
+        twist_offset = 0.0
+        twist_clamped_frames = 0
+        if twist_cfg and twist_pair is not None:
+            twist_ref_pts = _extract_group_points(Q_df, twist_cfg['ref'])
+            twist_up_pts = _extract_group_points(Q_df, twist_cfg['up'])
+            tw_samples = []
+            for row_id in range(len(Q_df)):
+                params = smoothed_params[row_id]
+                if params is None:
+                    continue
+                rp = _rigid_points_from_params(params, template)
+                ang = _twist_angle_deg(rp[twist_pair[1]] - rp[twist_pair[0]],
+                                       twist_ref_pts[row_id][0] - twist_ref_pts[row_id][1],
+                                       twist_up_pts[row_id][1] - twist_up_pts[row_id][0])
+                if ang is not None:
+                    tw_samples.append(ang)
+            if tw_samples:
+                twist_offset = float(np.median(tw_samples))
+
         for row_id, fit in enumerate(fits):
             if fit is None:
                 continue
@@ -1239,6 +1490,41 @@ def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df,
                 rigid_points = fit['points']
                 error = fit['error']
                 marker_errors = fit['marker_errors']
+
+            # Guard against the rigid fit settling into a left/right-swapped pose.
+            # On a rejected frame the independent triangulation that would otherwise
+            # be kept is, under the same foreshortening that triggered the swap,
+            # degenerate: the pelvis lateral axis collapses and its yaw wobbles
+            # +-90..180 deg -> visible "hip shaking / flipping". The pelvis is rigid
+            # and its yaw is temporally continuous, so instead of falling back to
+            # that degenerate frame we HOLD the last accepted rigid orientation,
+            # re-centred on the current fit's centroid (a 180 deg yaw flip leaves the
+            # centroid invariant) -> constant width, continuous yaw, correct
+            # chirality, while still tracking the pelvis translation. Only when no
+            # accepted orientation exists yet (or hold disabled) do we keep the
+            # independent triangulation as before.
+            if chirality_pairs:
+                if not _rigid_chirality_ok(chirality_pairs, group_points[row_id], rigid_points, chirality_dirs):
+                    chirality_rejected_frames += 1
+                    if not (chirality_hold and last_accepted_rigid is not None
+                            and np.all(np.isfinite(rigid_points))):
+                        continue
+                    rigid_points = (last_accepted_rigid
+                                    - last_accepted_rigid.mean(axis=0)
+                                    + rigid_points.mean(axis=0))
+                    chirality_held_frames += 1
+                    _update_chirality_dirs(chirality_pairs, rigid_points, rigid_points, chirality_dirs)
+                else:
+                    _update_chirality_dirs(chirality_pairs, group_points[row_id], rigid_points, chirality_dirs)
+                last_accepted_rigid = rigid_points.copy()
+
+            if twist_cfg and twist_pair is not None:
+                rigid_points, clamped = _clamp_twist(
+                    rigid_points, twist_pair,
+                    twist_ref_pts[row_id], twist_up_pts[row_id],
+                    twist_offset, twist_cfg['max_deg'])
+                if clamped:
+                    twist_clamped_frames += 1
 
             accepted_frames += 1
             corrected_points, guard_stats = _guarded_rigid_points(
@@ -1293,6 +1579,9 @@ def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df,
             'correction_limited_frames': correction_limited_frames,
             'pairwise_guarded_frames': pairwise_guarded_frames,
             'pairwise_rejected_frames': pairwise_rejected_frames,
+            'chirality_rejected_frames': chirality_rejected_frames,
+            'chirality_held_frames': chirality_held_frames,
+            'twist_clamped_frames': twist_clamped_frames,
             'elapsed_seconds': elapsed_seconds,
         })
         logging.info(
@@ -1305,10 +1594,86 @@ def refine_rigid_marker_groups(config_dict, Q_df, error_df, nb_cams_excluded_df,
             + f"; correction limit adjusted {correction_limited_frames} frames"
             + f"; pairwise guard adjusted {pairwise_guarded_frames} frames"
             + f", rejected {pairwise_rejected_frames}"
+            + f"; chirality rejected {chirality_rejected_frames} frames"
+            + (f" ({chirality_held_frames} held to last orientation)" if chirality_held_frames else "")
+            + (f"; twist-clamped {twist_clamped_frames} frames" if twist_clamped_frames else "")
             + f"; elapsed {elapsed_seconds:.2f} s."
         )
 
     return stats
+
+
+def _skeleton_bone_indices(model, keypoints_names):
+    '''Parent->child marker-index pairs from the skeleton tree (each node linked to its
+    nearest id-bearing ancestor), in the keypoints_names index space. These are the
+    'bones' whose length is (near) constant for a rigid skeleton.'''
+    name_to_idx = {n: i for i, n in enumerate(keypoints_names)}
+    bones = []
+    for _, _, node in RenderTree(model):
+        if node.name not in name_to_idx:
+            continue
+        anc = node.parent
+        while anc is not None and anc.name not in name_to_idx:
+            anc = anc.parent
+        if anc is not None and anc.name != node.name:
+            bones.append((name_to_idx[anc.name], name_to_idx[node.name]))
+    return bones
+
+
+def reject_nonphysical_limbs(Q_df, error_df, bones, protected_ids, max_ratio=1.8,
+                             min_len_m=0.05, min_excess_m=0.15, id_person=0):
+    '''Repair non-physical bone lengths. Bones don't stretch, so a segment longer than
+    ``max_ratio`` x its robust trial-median length is a triangulation error (typically a
+    marker flung far by a 2-camera disagreement). The offending DISTAL endpoint is pulled
+    back along the bone direction to the median length, anchored to its (already-repaired)
+    parent, so no metre-long limb is ever emitted.
+
+    A bone must exceed BOTH the ratio AND an absolute ``min_excess_m`` over its median to
+    trigger. The absolute floor keeps the guard targeting gross explosions (metre-long
+    arms): on short, noisy bones (heel/toe, median ~5 cm) a bare 1.8x ratio is only a few
+    cm and would clobber genuine keypoint jitter — generality first. Real fast motion never
+    changes a bone length, so genuine frames are untouched.
+
+    Why rescale the distal child rather than drop the higher-reproj-error endpoint: a marker
+    flung by two agreeing-but-wrong cameras has a LOW reprojection error (it fits both rays),
+    so reproj error mis-identifies the culprit. ``bones`` is in skeleton root->leaf order, so
+    (a, b) is always (parent, child); pulling the child toward an already-corrected parent
+    fixes whole limb chains in a single pass and guarantees the physical-length invariant
+    regardless of how many markers in the chain exploded.'''
+    n = len(Q_df)
+    coords = Q_df.to_numpy(dtype=float, copy=True).reshape(n, -1, 3)
+    medians = {}
+    for a, b in bones:
+        lengths = np.linalg.norm(coords[:, a] - coords[:, b], axis=1)
+        med = np.nanmedian(lengths)
+        if np.isfinite(med) and med > min_len_m:
+            medians[(a, b)] = med
+    rejected = 0
+    for i in range(n):
+        for (a, b), med in medians.items():
+            pa, pb = coords[i, a], coords[i, b]
+            if not (np.all(np.isfinite(pa)) and np.all(np.isfinite(pb))):
+                continue
+            vec = pb - pa
+            length = np.linalg.norm(vec)
+            if length <= med * max_ratio or length - med <= min_excess_m:
+                continue
+            # Pull the distal child in to the median length, anchored to the parent. If the
+            # child is rigid-locked, anchor to the child and pull the parent in instead; if
+            # both are rigid-protected, leave it to the rigid refine.
+            if b not in protected_ids:
+                coords[i, b] = pa + vec * (med / length)
+            elif a not in protected_ids:
+                coords[i, a] = pb - vec * (med / length)
+            else:
+                continue
+            rejected += 1
+    if rejected:
+        Q_df.iloc[:, :] = coords.reshape(n, -1)
+        logging.info(f'Non-physical limb guard for person {id_person}: repaired {rejected} '
+                     f'marker-frames whose bone exceeded {max_ratio:g}x its median length '
+                     f'(and +{min_excess_m:g} m absolute).')
+    return rejected
 
 
 def extract_files_frame_f(json_tracked_files_f, keypoints_ids, nb_persons_to_detect):
@@ -1708,6 +2073,17 @@ def triangulate_all(config_dict):
                 rigid_groups,
                 id_person=n,
             )
+
+    # Repair non-physical limbs (markers flung far by bad multi-view geometry) by pulling
+    # the distal endpoint back to its median bone length, so no metre-long bone is emitted.
+    if config_dict.get('triangulation', {}).get('reject_nonphysical_limbs', True):
+        bones = _skeleton_bone_indices(model, keypoints_names)
+        protected_ids = {idx for group in (rigid_groups or []) for idx in group['indices']}
+        max_ratio = float(config_dict.get('triangulation', {}).get('limb_length_max_ratio', 1.8))
+        min_excess = float(config_dict.get('triangulation', {}).get('limb_length_min_excess_m', 0.15))
+        for n in range(nb_persons_to_detect):
+            reject_nonphysical_limbs(Q_tot[n], error_tot[n], bones, protected_ids,
+                                     max_ratio=max_ratio, min_excess_m=min_excess, id_person=n)
 
     # Interpolate small missing sections
     for n in range(nb_persons_to_detect):

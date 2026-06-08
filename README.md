@@ -65,6 +65,34 @@ Pose2Sim stands for "OpenPose to OpenSim", as it originally used *OpenPose* inpu
 
 </br>
 
+---
+
+# 🟦 HZVision fork — markerless stabilization enhancements
+
+> This branch (`pose2sim-hzvision`) is a long-lived fork maintained for the **HZVision / PnVision** 4-camera capture pipeline. It keeps the full upstream Pose2Sim history and adds an `avi2trc` entry point plus a set of **triangulation-stage stabilization features** that remove jitter, gap-teleports, and left/right swaps observed on real production trials (bending, turning, walking, occlusion). **All additions are opt-in and default-off — with no extra config the output is byte-identical to upstream Pose2Sim.**
+
+**What this fork adds on top of original Pose2Sim:**
+
+| Area | Enhancement | Problem it solves |
+|------|-------------|-------------------|
+| 2D pose | Temporal smoothing (`one_euro`) + don't-drop-low-average-pose | Per-frame foot/hip flicker; whole-frame blanking during bends/occlusion |
+| 2D pose | Single-person selection / association | Wrong person picked across cameras in crowded frames |
+| Triangulation | **Rigid marker groups** (`pelvis`, `head`) with Procrustes/Kabsch template | Pelvis stretch/shrink & 20 cm gap-teleports from the regressed virtual Hip keypoint |
+| Triangulation | **Chirality guard + hold** | Left/right hip reversal while walking under foreshortening + back-view cameras |
+| Triangulation | **Robust SO(3) orientation smoothing** (geodesic medoid) | Residual yaw spikes/flips on foreshortened static (turn-in-place) trials |
+| Triangulation | **Anatomical twist clamp** | Rigid pelvis over-rotating "like smooth rods" with no torso coupling |
+| Triangulation | **Non-physical limb guard** | Independent arms/shoulders exploding to 1–2 m under 2-camera disagreement |
+| Pipeline | `avi2trc` CLI + batched pose inference + parallel triangulation + mosaic save_video | One-command AVI → TRC for HZVision; faster throughput; visual QA |
+
+All triangulation features are configured via `rigid_marker_groups` and `rigid_group_*` / `reject_nonphysical_limbs` keys in `Config.toml`. Production recipe and rationale: **[`docs/hzvision-integration.md`](docs/hzvision-integration.md)**.
+
+**Quick start (this fork):**
+```bash
+avi2trc --trial-dir /path/to/Session/Trial_1 --batch-size 16 --overwrite-pose
+```
+
+---
+
 # Contents
 1. [Installation and Demonstration](#installation-and-demonstration)
    1. [Installation](#installation)
